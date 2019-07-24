@@ -1,4 +1,4 @@
-package provider
+package node
 
 // Right now this test lives here because it needs the mock provider, which is an internal module.
 // If we move it out of this part of the tree, we can also moves this test.
@@ -12,11 +12,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/pkg/errors"
-	"github.com/virtual-kubelet/virtual-kubelet/cmd/virtual-kubelet/internal/provider/mock"
+	"github.com/virtual-kubelet/virtual-kubelet/examples/providers/mock"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	logruslogger "github.com/virtual-kubelet/virtual-kubelet/log/logrus"
-	"github.com/virtual-kubelet/virtual-kubelet/node"
 	"gotest.tools/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -42,18 +40,20 @@ func init() {
 	klog.InitFlags(nil)
 }
 
-func TestBasic(t *testing.T) {
+func TestPodLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	newLogger := logruslogger.FromLogrus(logrus.NewEntry(logrus.StandardLogger()))
 	logrus.SetLevel(logrus.DebugLevel)
+
 	// Right now, new loggers that are created from spans are broken since log.L isn't set.
 	ctx = log.WithLogger(ctx, newLogger)
 
 	// Create the fake client.
 	client := fake.NewSimpleClientset()
 
+	// This is largely copy and pasted code from the root command
 	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
 		client,
 		informerResyncPeriod,
@@ -61,7 +61,6 @@ func TestBasic(t *testing.T) {
 	)
 	podInformer := podInformerFactory.Core().V1().Pods()
 
-	// Create another shared informer factory for Kubernetes secrets and configmaps (not subject to any selectors).
 	scmInformerFactory := kubeinformers.NewSharedInformerFactory(client, informerResyncPeriod)
 
 	eb := record.NewBroadcaster()
@@ -86,7 +85,7 @@ func TestBasic(t *testing.T) {
 
 	mockProvider, err := mock.NewMockProviderMockConfig(mock.MockConfig{}, testNodeName, "linux", "1.2.3.4", 0)
 	assert.NilError(t, err)
-	config := node.PodControllerConfig{
+	config := PodControllerConfig{
 		PodClient:         client.CoreV1(),
 		PodInformer:       podInformer,
 		EventRecorder:     fakeRecorder,
@@ -96,7 +95,7 @@ func TestBasic(t *testing.T) {
 		ServiceInformer:   serviceInformer,
 	}
 
-	pc, err := node.NewPodController(config)
+	pc, err := NewPodController(config)
 	assert.NilError(t, err)
 
 	p := corev1.Pod{
@@ -154,7 +153,6 @@ func TestBasic(t *testing.T) {
 	watcher, err = client.CoreV1().Pods(testNamespace).Watch(listOptions)
 	assert.NilError(t, err)
 	go func() {
-
 		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
 			// Wait for the pod to be started
 			func(ev watch.Event) (bool, error) {
