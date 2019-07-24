@@ -26,6 +26,8 @@ import (
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/klog"
+
+	watchutils "k8s.io/client-go/tools/watch"
 )
 
 const (
@@ -46,8 +48,9 @@ func TestBasic(t *testing.T) {
 
 	newLogger := logruslogger.FromLogrus(logrus.NewEntry(logrus.StandardLogger()))
 	logrus.SetLevel(logrus.DebugLevel)
-	log.L = newLogger
+	// Right now, new loggers that are created from spans are broken since log.L isn't set.
 	ctx = log.WithLogger(ctx, newLogger)
+
 	// Create the fake client.
 	client := fake.NewSimpleClientset()
 
@@ -55,9 +58,6 @@ func TestBasic(t *testing.T) {
 		client,
 		informerResyncPeriod,
 		kubeinformers.WithNamespace(testNamespace),
-		//		kubeinformers.WithTweakListOptions(func(options *metav1.ListOptions) {
-		//			options.FieldSelector = fields.OneTermEqualSelector("spec.nodeName", testNodeName).String()
-		//		}))
 	)
 	podInformer := podInformerFactory.Core().V1().Pods()
 
@@ -98,7 +98,6 @@ func TestBasic(t *testing.T) {
 
 	pc, err := node.NewPodController(config)
 	assert.NilError(t, err)
-	// time.AfterFunc(300*time.Second, cancel)
 
 	p := corev1.Pod{
 		TypeMeta: metav1.TypeMeta{
@@ -114,19 +113,30 @@ func TestBasic(t *testing.T) {
 		Spec: corev1.PodSpec{
 			NodeName: testNodeName,
 		},
+		Status: corev1.PodStatus{
+			Phase: corev1.PodPending,
+		},
 	}
 
-	assert.NilError(t, err)
-	watcher, err := client.CoreV1().Pods(testNamespace).Watch(metav1.ListOptions{
+	listOptions := metav1.ListOptions{
 		FieldSelector: fields.OneTermEqualSelector("metadata.name", p.ObjectMeta.Name).String(),
-	})
-	assert.NilError(t, err)
-
-	helper := watchHelper{
-		w:           watcher,
-		watchEvents: make(chan pseudoEvent, 100),
 	}
-	go helper.waitLoop(ctx)
+
+	watchErrCh := make(chan error)
+
+	watcher, err := client.CoreV1().Pods(testNamespace).Watch(listOptions)
+	assert.NilError(t, err)
+	go func() {
+		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
+			// Wait for the pod to be created
+			// TODO(Sargun): Make this "smarter" about the status the pod is in.
+			func(ev watch.Event) (bool, error) {
+				pod := ev.Object.(*corev1.Pod)
+				return pod.Name == p.ObjectMeta.Name, nil
+			})
+
+		watchErrCh <- watchErr
+	}()
 
 	go podInformerFactory.Start(ctx.Done())
 	go scmInformerFactory.Start(ctx.Done())
@@ -134,56 +144,65 @@ func TestBasic(t *testing.T) {
 	_, e := client.CoreV1().Pods(testNamespace).Create(&p)
 	assert.NilError(t, e)
 
-	// Wait for the pod to be created
-	for ev := range helper.watchEvents {
-		assert.NilError(t, ev.error)
-		// TODO(Sargun): Maybe check what kind of pod was added?
-		if ev.event.Type == watch.Added {
-			goto podcreated
-
-		}
-	}
-podcreated:
+	assert.NilError(t, <-watchErrCh)
 
 	podControllerErrCh := make(chan error, 1)
 	go func() {
 		podControllerErrCh <- pc.Run(ctx, podSyncWorkers)
 	}()
 
-	// Wait for the pod to go into running
-	for {
-		select {
-		case err := <-podControllerErrCh:
-			assert.NilError(t, err)
-		case ev := <-helper.watchEvents:
-			assert.NilError(t, ev.error)
-			if pod := ev.event.Object.(*corev1.Pod); pod.Status.Phase == corev1.PodRunning {
-				goto podrunning
+	watcher, err = client.CoreV1().Pods(testNamespace).Watch(listOptions)
+	assert.NilError(t, err)
+	go func() {
 
-			}
-		}
+		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
+			// Wait for the pod to be started
+			func(ev watch.Event) (bool, error) {
+				pod := ev.Object.(*corev1.Pod)
+				return pod.Status.Phase == corev1.PodRunning, nil
+			})
+
+		watchErrCh <- watchErr
+	}()
+
+	select {
+	case <-ctx.Done():
+		t.Fatal("Context ended early")
+	case err = <-podControllerErrCh:
+		assert.NilError(t, err)
+	case err = <-watchErrCh:
+		assert.NilError(t, err)
+
 	}
 
-podrunning:
+	watcher, err = client.CoreV1().Pods(testNamespace).Watch(listOptions)
+	assert.NilError(t, err)
+	go func() {
+		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
+			// Wait for the pod to be started
+			func(ev watch.Event) (bool, error) {
+				// TODO(Sargun): The pod should have transitioned into some status around failed / succeeded
+				// prior to being deleted.
+				// In addition, we should check if the deletion timestamp gets set
+				return ev.Type == watch.Deleted, nil
+			})
+		watchErrCh <- watchErr
+	}()
+
 	assert.NilError(t, client.CoreV1().Pods(testNamespace).Delete(p.Name, nil))
 
-	// Wait for the pod to be "deleted" from API Server
-	for {
-		select {
-		case err := <-podControllerErrCh:
-			assert.NilError(t, err)
-		case ev := <-helper.watchEvents:
-			assert.NilError(t, ev.error)
-			if ev.event.Type == watch.Deleted {
-				goto poddeleted
-			}
-		}
+	select {
+	case <-ctx.Done():
+		t.Fatal("Context ended early")
+	case err = <-podControllerErrCh:
+		assert.NilError(t, err)
+	case err = <-watchErrCh:
+		assert.NilError(t, err)
+
 	}
 
-poddeleted:
 	cancel()
 	assert.NilError(t, <-podControllerErrCh)
-
 }
 
 type pseudoEvent struct {
