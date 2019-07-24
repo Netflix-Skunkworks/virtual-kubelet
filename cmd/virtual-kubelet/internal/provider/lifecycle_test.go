@@ -204,37 +204,3 @@ func TestBasic(t *testing.T) {
 	cancel()
 	assert.NilError(t, <-podControllerErrCh)
 }
-
-type pseudoEvent struct {
-	event watch.Event
-	error error
-}
-type watchHelper struct {
-	w           watch.Interface
-	watchEvents chan pseudoEvent
-}
-
-func (wh *watchHelper) waitLoop(ctx context.Context) {
-	defer close(wh.watchEvents)
-	for {
-		select {
-		case <-ctx.Done():
-			wh.w.Stop()
-			wh.watchEvents <- pseudoEvent{error: ctx.Err()}
-			return
-		case event := <-wh.w.ResultChan():
-			ev := pseudoEvent{event: event}
-			// The only time we explicitly shutdown / close is if there is an error
-			if event.Type == watch.Error {
-				if status, ok := event.Object.(*metav1.Status); ok {
-					ev.error = errors.New(status.Message)
-				} else {
-					ev.error = errors.New("Encountered unknown errors in event stream")
-				}
-				wh.watchEvents <- ev
-				return
-			}
-			wh.watchEvents <- ev
-		}
-	}
-}
