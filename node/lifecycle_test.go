@@ -100,7 +100,7 @@ func TestPodLifecycle(t *testing.T) {
 			return
 		}
 		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+			assert.NilError(t, wireUpSystem(ctx, WrapLegacyPodLifecycleHandler(ctx, newMockV0Provider(), 100*time.Millisecond), func(ctx context.Context, s *system) {
 				testCreateStartDeleteScenario(ctx, t, s)
 			}))
 		})
@@ -121,7 +121,7 @@ func TestPodLifecycle(t *testing.T) {
 
 		t.Run("mockV0Provider", func(t *testing.T) {
 			mp := newMockV0Provider()
-			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+			assert.NilError(t, wireUpSystem(ctx, WrapLegacyPodLifecycleHandler(ctx, mp, 100*time.Millisecond), func(ctx context.Context, s *system) {
 				testDanglingPodScenario(ctx, t, s, mp)
 			}))
 		})
@@ -141,7 +141,7 @@ func TestPodLifecycle(t *testing.T) {
 		}
 
 		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+			assert.NilError(t, wireUpSystem(ctx, WrapLegacyPodLifecycleHandler(ctx, newMockV0Provider(), 100*time.Millisecond), func(ctx context.Context, s *system) {
 				testFailedPodScenario(ctx, t, s)
 			}))
 		})
@@ -159,7 +159,7 @@ func TestPodLifecycle(t *testing.T) {
 			return
 		}
 		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+			assert.NilError(t, wireUpSystem(ctx, WrapLegacyPodLifecycleHandler(ctx, newMockV0Provider(), 100*time.Millisecond), func(ctx context.Context, s *system) {
 				testSucceededPodScenario(ctx, t, s)
 			}))
 		})

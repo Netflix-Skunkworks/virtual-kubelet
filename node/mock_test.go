@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	_ PodLifecycleHandler = (*mockV0Provider)(nil)
-	_ PodNotifier         = (*mockProvider)(nil)
+	_ LegacyPodLifecycleHandler = (*mockV0Provider)(nil)
+	_ PodLifecycleHandler       = (*mockProvider)(nil)
 )
 
 type mockV0Provider struct {
