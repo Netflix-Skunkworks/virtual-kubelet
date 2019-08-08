@@ -86,10 +86,8 @@ func (r *fakeDiscardingRecorder) AnnotatedEventf(object runtime.Object, annotati
 }
 
 func TestPodLifecycle(t *testing.T) {
-	// We don't do the defer cancel() thing here because t.Run is non-blocking, so the parent context may be cancelled
-	// before the children are finished and there is no way to do a "join" and wait for them without using a waitgroup,
-	// at which point, it doesn't seem much better.
-	ctx := context.Background()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	ctx = log.WithLogger(ctx, log.L)
 
@@ -100,116 +98,122 @@ func TestPodLifecycle(t *testing.T) {
 		// In addition, we should check if the deletion timestamp gets set
 		return ev.Type == watch.Deleted, nil
 	}
-	t.Run("createStartDeleteScenario", func(t *testing.T) {
-		// Wait for the pod to be started
 
-		t.Run("mockProvider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockProvider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
-			}))
-		})
+	t.Run("scenarios", func(t *testing.T) {
 
-		if testing.Short() {
-			return
-		}
-		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
-			}))
-		})
-	})
+		t.Run("createStartDeleteScenario", func(t *testing.T) {
+			// Wait for the pod to be started
 
-	t.Run("createStartDeleteScenarioWithDeletionErrorNotFound", func(t *testing.T) {
-		// Wait for the pod to be started
-		mp := newMockProvider()
-		mp.errorOnDelete = errdefs.NotFound("not found")
-		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-			testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
-		}))
-	})
+			t.Run("mockProvider", func(t *testing.T) {
+				assert.NilError(t, wireUpSystem(ctx, newMockProvider(), func(ctx context.Context, s *system) {
+					testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				}))
+			})
 
-	t.Run("createStartDeleteScenarioWithDeletionRandomError", func(t *testing.T) {
-		mp := newMockProvider()
-		// Wait for the pod to be started
-		deletionFunc := func(ev watch.Event) (bool, error) {
-			for atomic.LoadUint64(&mp.attemptedDeletes) < 2 {
+			if testing.Short() {
+				return
 			}
-			return true, nil
-		}
-		mp.errorOnDelete = errors.New("random error")
-		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-			testCreateStartDeleteScenario(ctx, t, s, deletionFunc)
-			pods, err := s.client.CoreV1().Pods(testNamespace).List(metav1.ListOptions{})
-			assert.NilError(t, err)
-			assert.Assert(t, is.Len(pods.Items, 1))
-			assert.Assert(t, pods.Items[0].DeletionTimestamp != nil)
-		}))
-	})
+			t.Run("mockV0Provider", func(t *testing.T) {
+				assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+					testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				}))
+			})
+		})
 
-	t.Run("danglingPodScenario", func(t *testing.T) {
-		t.Run("mockProvider", func(t *testing.T) {
+		t.Run("createStartDeleteScenarioWithDeletionErrorNotFound", func(t *testing.T) {
+			// Wait for the pod to be started
 			mp := newMockProvider()
+			mp.errorOnDelete = errdefs.NotFound("not found")
 			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-				testDanglingPodScenario(ctx, t, s, mp.mockV0Provider)
+				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
 			}))
 		})
 
-		if testing.Short() {
-			return
-		}
-
-		t.Run("mockV0Provider", func(t *testing.T) {
-			mp := newMockV0Provider()
-			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-				testDanglingPodScenario(ctx, t, s, mp)
-			}))
-		})
-	})
-
-	t.Run("failedPodScenario", func(t *testing.T) {
-		t.Run("mockProvider", func(t *testing.T) {
+		t.Run("createStartDeleteScenarioWithDeletionRandomError", func(t *testing.T) {
 			mp := newMockProvider()
+			// Wait for the pod to be started
+			deletionFunc := func(ev watch.Event) (bool, error) {
+				for atomic.LoadUint64(&mp.attemptedDeletes) < 2 {
+				}
+				return true, nil
+			}
+			mp.errorOnDelete = errors.New("random error")
 			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-				testFailedPodScenario(ctx, t, s)
+				testCreateStartDeleteScenario(ctx, t, s, deletionFunc)
+				pods, err := s.client.CoreV1().Pods(testNamespace).List(metav1.ListOptions{})
+				assert.NilError(t, err)
+				assert.Assert(t, is.Len(pods.Items, 1))
+				assert.Assert(t, pods.Items[0].DeletionTimestamp != nil)
 			}))
 		})
 
-		if testing.Short() {
-			return
-		}
+		t.Run("danglingPodScenario", func(t *testing.T) {
+			t.Run("mockProvider", func(t *testing.T) {
+				mp := newMockProvider()
+				assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+					testDanglingPodScenario(ctx, t, s, mp.mockV0Provider)
+				}))
+			})
 
-		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
-				testFailedPodScenario(ctx, t, s)
-			}))
+			if testing.Short() {
+				return
+			}
+
+			t.Run("mockV0Provider", func(t *testing.T) {
+				mp := newMockV0Provider()
+				assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+					testDanglingPodScenario(ctx, t, s, mp)
+				}))
+			})
 		})
+
+		t.Run("failedPodScenario", func(t *testing.T) {
+			t.Run("mockProvider", func(t *testing.T) {
+				mp := newMockProvider()
+				assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+					testFailedPodScenario(ctx, t, s)
+				}))
+			})
+
+			if testing.Short() {
+				return
+			}
+
+			t.Run("mockV0Provider", func(t *testing.T) {
+				assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+					testFailedPodScenario(ctx, t, s)
+				}))
+			})
+		})
+
+		t.Run("succeededPodScenario", func(t *testing.T) {
+			t.Run("mockProvider", func(t *testing.T) {
+				mp := newMockProvider()
+				assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+					testSucceededPodScenario(ctx, t, s)
+				}))
+			})
+			if testing.Short() {
+				return
+			}
+			t.Run("mockV0Provider", func(t *testing.T) {
+				assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
+					testSucceededPodScenario(ctx, t, s)
+				}))
+			})
+		})
+
+		t.Run("updatePodWhileRunningScenario", func(t *testing.T) {
+			t.Run("mockProvider", func(t *testing.T) {
+				mp := newMockProvider()
+				assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+					testUpdatePodWhileRunningScenario(ctx, t, s, mp)
+				}))
+			})
+		})
+
 	})
 
-	t.Run("succeededPodScenario", func(t *testing.T) {
-		t.Run("mockProvider", func(t *testing.T) {
-			mp := newMockProvider()
-			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-				testSucceededPodScenario(ctx, t, s)
-			}))
-		})
-		if testing.Short() {
-			return
-		}
-		t.Run("mockV0Provider", func(t *testing.T) {
-			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
-				testSucceededPodScenario(ctx, t, s)
-			}))
-		})
-	})
-
-	t.Run("updatePodWhileRunningScenario", func(t *testing.T) {
-		t.Run("mockProvider", func(t *testing.T) {
-			mp := newMockProvider()
-			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-				testUpdatePodWhileRunningScenario(ctx, t, s, mp)
-			}))
-		})
-	})
 }
 
 type testFunction func(ctx context.Context, s *system)
@@ -344,6 +348,7 @@ func testDanglingPodScenario(ctx context.Context, t *testing.T, s *system, m *mo
 }
 
 func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system, deletionFunction watchutils.ConditionFunc) {
+	t.Parallel()
 
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
