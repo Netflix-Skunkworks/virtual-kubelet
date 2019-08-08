@@ -210,6 +210,15 @@ func TestPodLifecycle(t *testing.T) {
 			}))
 		})
 	})
+
+	t.Run("createErrorScenario", func(t *testing.T) {
+		t.Run("mockProvider", func(t *testing.T) {
+			mp := newMockProvider()
+			assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+				testCreateErrorScenario(ctx, t, s, mp)
+			}))
+		})
+	})
 }
 
 type testFunction func(ctx context.Context, s *system)
@@ -341,6 +350,59 @@ func testDanglingPodScenario(ctx context.Context, t *testing.T, s *system, m *mo
 
 	assert.Assert(t, m.deletes == 1)
 
+}
+
+func testCreateErrorScenario(ctx context.Context, t *testing.T, s *system, mp *mockProvider) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	mp.errorOnCreate = errors.New("Random error")
+	p := newPod()
+	p.Spec.RestartPolicy = corev1.RestartPolicyNever
+
+	listOptions := metav1.ListOptions{
+		FieldSelector: fields.OneTermEqualSelector("metadata.name", p.ObjectMeta.Name).String(),
+	}
+
+	// Create the Pod
+	_, e := s.client.CoreV1().Pods(testNamespace).Create(p)
+	assert.NilError(t, e)
+
+	watchErrCh := make(chan error)
+	var failedPod *corev1.Pod
+	// Setup a watch to check if the pod went into failed
+	watcher, err := s.client.CoreV1().Pods(testNamespace).Watch(listOptions)
+	assert.NilError(t, err)
+	defer watcher.Stop()
+	go func() {
+		failedPodEvent, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
+			// Wait for the pod to be started
+			func(ev watch.Event) (bool, error) {
+				pod := ev.Object.(*corev1.Pod)
+				return pod.Status.Phase == corev1.PodFailed, nil
+			})
+		if watchErr == nil {
+			failedPod = failedPodEvent.Object.(*corev1.Pod)
+		}
+		watchErrCh <- watchErr
+	}()
+
+	// Start the pod controller
+	podControllerErrCh := s.start(ctx)
+
+	// Wait for the pod to go into running
+	select {
+	case <-ctx.Done():
+		t.Fatalf("Context ended early: %s", ctx.Err().Error())
+	case err = <-watchErrCh:
+		assert.NilError(t, err)
+	case err = <-podControllerErrCh:
+		assert.NilError(t, err)
+		t.Fatal("Pod controller terminated early")
+	}
+
+	assert.Assert(t, is.Equal(failedPod.Status.Message, mp.errorOnCreate.Error()))
 }
 
 func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system, deletionFunction watchutils.ConditionFunc) {

@@ -20,11 +20,13 @@ var (
 
 type mockV0Provider struct {
 	creates          uint64
+	attemptedCreates uint64
 	updates          uint64
 	deletes          uint64
 	attemptedDeletes uint64
 
 	errorOnDelete error
+	errorOnCreate error
 
 	pods         sync.Map
 	startTime    time.Time
@@ -62,6 +64,11 @@ func (p *mockV0Provider) notifier(pod *v1.Pod) {
 // CreatePod accepts a Pod definition and stores it in memory.
 func (p *mockV0Provider) CreatePod(ctx context.Context, pod *v1.Pod) error {
 	log.G(ctx).Infof("receive CreatePod %q", pod.Name)
+	atomic.AddUint64(&p.attemptedCreates, 1)
+
+	if p.errorOnCreate != nil {
+		return p.errorOnCreate
+	}
 
 	atomic.AddUint64(&p.creates, 1)
 	key, err := buildKey(pod)
