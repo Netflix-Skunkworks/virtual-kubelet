@@ -224,7 +224,7 @@ func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) e
 	status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
 	if err != nil && !errdefs.IsNotFound(err) {
 		span.SetStatus(err)
-		return pkgerrors.Wrap(err, "error retreiving pod status")
+		return pkgerrors.Wrap(err, "error retrieving pod status")
 	}
 
 	// Copy the status, so we do not reference it, in case the provider changes it
@@ -295,7 +295,7 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
-		return pkgerrors.Wrap(err, "error spliting cache key")
+		return pkgerrors.Wrap(err, "error splitting cache key")
 	}
 
 	pod, err := pc.podsLister.Pods(namespace).Get(name)
