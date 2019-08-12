@@ -64,12 +64,12 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod)
 
 	// We have to use a  different pod that we pass to the provider than the one that gets used in handleProviderError
 	// because the provider  may manipulate the pod in a separate goroutine while we were doing work
-	providerPod := pod.DeepCopy()
+	podForProvider := pod.DeepCopy()
 
 	// Check if the pod is already known by the provider.
 	// NOTE: Some providers return a non-nil error in their GetPod implementation when the pod is not found while some other don't.
 	// Hence, we ignore the error and just act upon the pod if it is non-nil (meaning that the provider still knows about the pod).
-	if pp, _ := pc.provider.GetPod(ctx, pod.Namespace, pod.Name); pp != nil {
+	if podFromProvider, _ := pc.provider.GetPod(ctx, pod.Namespace, pod.Name); podFromProvider != nil {
 		// Pod Update Only Permits update of:
 		// - `spec.containers[*].image`
 		// - `spec.initContainers[*].image`
@@ -78,21 +78,21 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod)
 		// - `objectmeta.labels`
 		// - `objectmeta.annotations`
 		// compare these subset of the pods to see if something has changed
-		if !reflect.DeepEqual(pp.Spec.Containers, providerPod.Spec.Containers) ||
-			!reflect.DeepEqual(pp.Spec.InitContainers, providerPod.Spec.InitContainers) ||
-			!reflect.DeepEqual(pp.Spec.ActiveDeadlineSeconds, providerPod.Spec.ActiveDeadlineSeconds) ||
-			!reflect.DeepEqual(pp.Spec.Tolerations, providerPod.Spec.Tolerations) ||
-			!reflect.DeepEqual(pp.ObjectMeta.Labels, providerPod.Labels) ||
-			!reflect.DeepEqual(pp.ObjectMeta.Annotations, providerPod.Annotations) {
-			log.G(ctx).Debugf("Pod %s exists, updating pod in provider", pp.Name)
-			if origErr := pc.provider.UpdatePod(ctx, providerPod); origErr != nil {
+		if !reflect.DeepEqual(podFromProvider.Spec.Containers, pod.Spec.Containers) ||
+			!reflect.DeepEqual(podFromProvider.Spec.InitContainers, pod.Spec.InitContainers) ||
+			!reflect.DeepEqual(podFromProvider.Spec.ActiveDeadlineSeconds, pod.Spec.ActiveDeadlineSeconds) ||
+			!reflect.DeepEqual(podFromProvider.Spec.Tolerations, pod.Spec.Tolerations) ||
+			!reflect.DeepEqual(podFromProvider.ObjectMeta.Labels, pod.Labels) ||
+			!reflect.DeepEqual(podFromProvider.ObjectMeta.Annotations, pod.Annotations) {
+			log.G(ctx).Debugf("Pod %s exists, updating pod in provider", podFromProvider.Name)
+			if origErr := pc.provider.UpdatePod(ctx, podForProvider); origErr != nil {
 				pc.handleProviderError(ctx, span, origErr, pod)
 				return origErr
 			}
 			log.G(ctx).Info("Updated pod in provider")
 		}
 	} else {
-		if origErr := pc.provider.CreatePod(ctx, providerPod); origErr != nil {
+		if origErr := pc.provider.CreatePod(ctx, podForProvider); origErr != nil {
 			pc.handleProviderError(ctx, span, origErr, pod)
 			return origErr
 		}
