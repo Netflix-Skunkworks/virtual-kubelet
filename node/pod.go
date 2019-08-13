@@ -16,11 +16,9 @@ package node
 
 import (
 	"context"
-	"hash/fnv"
 	"reflect"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
@@ -93,6 +91,8 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod)
 				return origErr
 			}
 			log.G(ctx).Info("Updated pod in provider")
+		} else {
+			log.G(ctx).WithField("podFromProvider", podFromProvider).WithField("podForProvider", podForProvider).Debug("Not updating pods, equivalent")
 		}
 	} else {
 		if origErr := pc.provider.CreatePod(ctx, podForProvider); origErr != nil {
@@ -102,20 +102,6 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod)
 		log.G(ctx).Info("Created pod in provider")
 	}
 	return nil
-}
-
-// This is basically the kube runtime's hash container functionality.
-// VK only operates at the Pod level so this is adapted for that
-func hashPodSpec(spec corev1.PodSpec) uint64 {
-	hash := fnv.New32a()
-	printer := spew.ConfigState{
-		Indent:         " ",
-		SortKeys:       true,
-		DisableMethods: true,
-		SpewKeys:       true,
-	}
-	printer.Fprintf(hash, "%#v", spec)
-	return uint64(hash.Sum32())
 }
 
 func (pc *PodController) handleProviderError(ctx context.Context, span trace.Span, origErr error, pod *corev1.Pod) {

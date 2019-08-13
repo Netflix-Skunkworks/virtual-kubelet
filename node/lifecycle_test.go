@@ -23,6 +23,7 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	watchutils "k8s.io/client-go/tools/watch"
 	"k8s.io/klog"
@@ -35,9 +36,9 @@ var (
 const (
 	// There might be a constant we can already leverage here
 	testNamespace        = "default"
-	informerResyncPeriod = time.Duration(1 * time.Second)
+	informerResyncPeriod = time.Duration(3 * time.Second)
 	testNodeName         = "testnode"
-	podSyncWorkers       = 3
+	podSyncWorkers       = 1
 )
 
 func init() {
@@ -263,6 +264,21 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 	// Create the fake client.
 	client := fake.NewSimpleClientset()
 
+	client.PrependReactor("update", "pods", func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
+		var pod *corev1.Pod
+
+		updateAction := action.(ktesting.UpdateAction)
+		pod = updateAction.GetObject().(*corev1.Pod)
+
+		resourceVersion, err := strconv.Atoi(pod.ResourceVersion)
+		if err != nil {
+			panic(errors.Wrap(err, "Could not parse resource version of pod"))
+		}
+		pod.ResourceVersion = strconv.Itoa(resourceVersion + 1)
+		pod.Generation += 1
+		return false, nil, nil
+	})
+
 	// This is largely copy and pasted code from the root command
 	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
 		client,
@@ -358,7 +374,6 @@ func testDanglingPodScenario(ctx context.Context, t *testing.T, s *system, m *mo
 }
 
 func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system, waitFunction func(ctx context.Context, watch watch.Interface) error) {
-
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -400,10 +415,7 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 
 	}
 
-	// Setup a watch to check if the pod is in running
-	watcher, err = s.client.CoreV1().Pods(testNamespace).Watch(listOptions)
-	assert.NilError(t, err)
-	defer watcher.Stop()
+	// Setup a goroutine to check if the pod is in running
 	go func() {
 		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher,
 			// Wait for the pod to be started
@@ -429,10 +441,8 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 		t.Fatal("Pod controller terminated early")
 	}
 
-	// Setup a watch prior to pod deletion
+	// Setup a goroutine prior to pod deletion
 	watcher, err = s.client.CoreV1().Pods(testNamespace).Watch(listOptions)
-	assert.NilError(t, err)
-	defer watcher.Stop()
 	go func() {
 		watchErrCh <- waitFunction(ctx, watcher)
 	}()
@@ -443,9 +453,6 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 	currentPod, err := s.client.CoreV1().Pods(testNamespace).Get(p.Name, metav1.GetOptions{})
 	assert.NilError(t, err)
 	// 2. Set the pod's deletion timestamp, version, and so on
-	curVersion, err := strconv.Atoi(currentPod.ResourceVersion)
-	assert.NilError(t, err)
-	currentPod.ResourceVersion = strconv.Itoa(curVersion + 1)
 	var deletionGracePeriod int64 = 30
 	currentPod.DeletionGracePeriodSeconds = &deletionGracePeriod
 	deletionTimestamp := metav1.NewTime(time.Now().Add(time.Second * time.Duration(deletionGracePeriod)))
@@ -506,28 +513,20 @@ func testUpdatePodWhileRunningScenario(ctx context.Context, t *testing.T, s *sys
 	select {
 	case <-ctx.Done():
 		t.Fatalf("Context ended early: %s", ctx.Err().Error())
-	case err = <-podControllerErrCh:
+	case err := <-podControllerErrCh:
 		assert.NilError(t, err)
 		t.Fatal("Pod controller exited prematurely without error")
-	case err = <-watchErrCh:
+	case err := <-watchErrCh:
 		assert.NilError(t, err)
 
 	}
 
-	// Update the pod
-	version, err := strconv.Atoi(p.ResourceVersion)
-	if err != nil {
-		t.Fatalf("Could not parse pod's resource version: %s", err.Error())
-	}
-
-	p.ResourceVersion = strconv.Itoa(version + 1)
 	var activeDeadlineSeconds int64 = 300
 	p.Spec.ActiveDeadlineSeconds = &activeDeadlineSeconds
 
-	log.G(ctx).WithField("pod", p).Info("Updating pod")
-	_, err = s.client.CoreV1().Pods(p.Namespace).Update(p)
+	p, err = s.client.CoreV1().Pods(p.Namespace).Update(p)
 	assert.NilError(t, err)
-	m.updates.until(func(v int) bool { return v > 0 })
+	log.G(ctx).WithField("pod", p).Info("Updated pod")
 }
 
 func BenchmarkCreatePods(b *testing.B) {
