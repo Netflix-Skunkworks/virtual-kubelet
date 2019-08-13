@@ -170,45 +170,9 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		resourceManager: rm,
 		ready:           make(chan struct{}),
 		recorder:        cfg.EventRecorder,
+
 		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
 	}
-
-	// Set up event handlers for when Pod resources change.
-	pc.podsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(pod interface{}) {
-			if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
-				log.L.Error(err)
-			} else {
-				pc.k8sQ.AddRateLimited(key)
-			}
-		},
-		UpdateFunc: func(oldObj, newObj interface{}) {
-			// Create a copy of the old and new pod objects so we don't mutate the cache.
-			oldPod := oldObj.(*corev1.Pod).DeepCopy()
-			newPod := newObj.(*corev1.Pod).DeepCopy()
-			// We want to check if the two objects differ in anything other than their resource versions.
-			// Hence, we make them equal so that this change isn't picked up by reflect.DeepEqual.
-			newPod.ResourceVersion = oldPod.ResourceVersion
-			// Skip adding this pod's key to the work queue if its .metadata (except .metadata.resourceVersion) and .spec fields haven't changed.
-			// This guarantees that we don't attempt to sync the pod every time its .status field is updated.
-			if reflect.DeepEqual(oldPod.ObjectMeta, newPod.ObjectMeta) && reflect.DeepEqual(oldPod.Spec, newPod.Spec) {
-				return
-			}
-			// At this point we know that something in .metadata or .spec has changed, so we must proceed to sync the pod.
-			if key, err := cache.MetaNamespaceKeyFunc(newPod); err != nil {
-				log.L.Error(err)
-			} else {
-				pc.k8sQ.AddRateLimited(key)
-			}
-		},
-		DeleteFunc: func(pod interface{}) {
-			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pod); err != nil {
-				log.L.Error(err)
-			} else {
-				pc.k8sQ.AddRateLimited(key)
-			}
-		},
-	})
 
 	return pc, nil
 }
@@ -228,6 +192,44 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 		return pkgerrors.New("failed to wait for caches to sync")
 	}
 	log.G(ctx).Info("Pod cache in-sync")
+
+	// Set up event handlers for when Pod resources change. Since the pod cache is in-sync, the informer will generate
+	// synthetic add events at this point.
+	pc.podsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc: func(pod interface{}) {
+			if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
+				log.G(ctx).Error(err)
+			} else {
+				pc.k8sQ.AddRateLimited(key)
+			}
+		},
+		UpdateFunc: func(oldObj, newObj interface{}) {
+			// Create a copy of the old and new pod objects so we don't mutate the cache.
+			oldPod := oldObj.(*corev1.Pod).DeepCopy()
+			newPod := newObj.(*corev1.Pod).DeepCopy()
+			// We want to check if the two objects differ in anything other than their resource versions.
+			// Hence, we make them equal so that this change isn't picked up by reflect.DeepEqual.
+			newPod.ResourceVersion = oldPod.ResourceVersion
+			// Skip adding this pod's key to the work queue if its .metadata (except .metadata.resourceVersion) and .spec fields haven't changed.
+			// This guarantees that we don't attempt to sync the pod every time its .status field is updated.
+			if reflect.DeepEqual(oldPod.ObjectMeta, newPod.ObjectMeta) && reflect.DeepEqual(oldPod.Spec, newPod.Spec) {
+				return
+			}
+			// At this point we know that something in .metadata or .spec has changed, so we must proceed to sync the pod.
+			if key, err := cache.MetaNamespaceKeyFunc(newPod); err != nil {
+				log.G(ctx).Error(err)
+			} else {
+				pc.k8sQ.AddRateLimited(key)
+			}
+		},
+		DeleteFunc: func(pod interface{}) {
+			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pod); err != nil {
+				log.G(ctx).Error(err)
+			} else {
+				pc.k8sQ.AddRateLimited(key)
+			}
+		},
+	})
 
 	// Perform a reconciliation step that deletes any dangling pods from the provider.
 	// This happens only when the virtual-kubelet is starting, and operates on a "best-effort" basis.
