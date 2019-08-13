@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,6 +26,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	watchutils "k8s.io/client-go/tools/watch"
 	"k8s.io/klog"
+	ktesting "k8s.io/client-go/testing"
 )
 
 var (
@@ -141,17 +141,7 @@ func TestPodLifecycle(t *testing.T) {
 	t.Run("createStartDeleteScenarioWithDeletionRandomError", func(t *testing.T) {
 		mp := newMockProvider()
 		deletionFunc := func(ctx context.Context, watcher watch.Interface) error {
-			select {
-			case <-mp.attemptedDeletes:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			select {
-			case <-mp.attemptedDeletes:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-			return nil
+			return mp.attemptedDeletes.until(ctx, func(v int) bool { return v >= 2 })
 		}
 		mp.errorOnDelete = errors.New("random error")
 		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
@@ -273,6 +263,21 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 	// Create the fake client.
 	client := fake.NewSimpleClientset()
 
+	client.PrependReactor("update", "pods", func(action ktesting.Action) (handled bool, ret runtime.Object, err error) {
+		var pod *corev1.Pod
+
+		updateAction := action.(ktesting.UpdateAction)
+		pod = updateAction.GetObject().(*corev1.Pod)
+
+		resourceVersion, err := strconv.Atoi(pod.ResourceVersion)
+		if err != nil {
+			panic(errors.Wrap(err, "Could not parse resource version of pod"))
+		}
+		pod.ResourceVersion = strconv.Itoa(resourceVersion + 1)
+		pod.Generation += 1
+		return false, nil, nil
+	})
+
 	// This is largely copy and pasted code from the root command
 	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
 		client,
@@ -344,6 +349,7 @@ func testTerminalStatePodScenario(ctx context.Context, t *testing.T, s *system, 
 	s.start(ctx)
 
 	for s.pc.k8sQ.Len() > 0 {
+		time.Sleep(10 * time.Millisecond)
 	}
 
 	p2, err := s.client.CoreV1().Pods(testNamespace).Get(p1.Name, metav1.GetOptions{})
@@ -362,7 +368,7 @@ func testDanglingPodScenario(ctx context.Context, t *testing.T, s *system, m *mo
 	// Start the pod controller
 	s.start(ctx)
 
-	assert.Assert(t, m.deletes == 1)
+	assert.Assert(t, is.Equal(m.deletes.read(), 1))
 
 }
 
@@ -452,9 +458,6 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 	currentPod, err := s.client.CoreV1().Pods(testNamespace).Get(p.Name, metav1.GetOptions{})
 	assert.NilError(t, err)
 	// 2. Set the pod's deletion timestamp, version, and so on
-	curVersion, err := strconv.Atoi(currentPod.ResourceVersion)
-	assert.NilError(t, err)
-	currentPod.ResourceVersion = strconv.Itoa(curVersion + 1)
 	var deletionGracePeriod int64 = 30
 	currentPod.DeletionGracePeriodSeconds = &deletionGracePeriod
 	deletionTimestamp := metav1.NewTime(time.Now().Add(time.Second * time.Duration(deletionGracePeriod)))
@@ -536,8 +539,7 @@ func testUpdatePodWhileRunningScenario(ctx context.Context, t *testing.T, s *sys
 	log.G(ctx).WithField("pod", p).Info("Updating pod")
 	_, err = s.client.CoreV1().Pods(p.Namespace).Update(p)
 	assert.NilError(t, err)
-	for atomic.LoadUint64(&m.updates) == 0 {
-	}
+	assert.NilError(t, m.updates.until(ctx, func(v int) bool { return v > 0 }))
 }
 
 func BenchmarkCreatePods(b *testing.B) {
