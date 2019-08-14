@@ -20,16 +20,15 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
-	"time"
 
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	"github.com/virtual-kubelet/virtual-kubelet/internal/manager"
 	"github.com/virtual-kubelet/virtual-kubelet/log"
 	"github.com/virtual-kubelet/virtual-kubelet/trace"
+	"golang.org/x/sync/errgroup"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -171,7 +170,7 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		ready:           make(chan struct{}),
 		recorder:        cfg.EventRecorder,
 
-		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
+		k8sQ: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
 	}
 
 	return pc, nil
@@ -180,12 +179,8 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 // Run will set up the event handlers for types we are interested in, as well as syncing informer caches and starting workers.
 // It will block until the context is cancelled, at which point it will shutdown the work queue and wait for workers to finish processing their current work items.
 func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
-	defer pc.k8sQ.ShutDown()
-
 	podStatusQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider")
 	pc.runSyncFromProvider(ctx, podStatusQueue)
-	pc.runProviderSyncWorkers(ctx, podStatusQueue, podSyncWorkers)
-	defer podStatusQueue.ShutDown()
 
 	// Wait for the caches to be synced *before* starting workers.
 	if ok := cache.WaitForCacheSync(ctx.Done(), pc.podsInformer.Informer().HasSynced); !ok {
@@ -236,22 +231,35 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	// If by any reason the provider fails to delete a dangling pod, it will stay in the provider and deletion won't be retried.
 	pc.deleteDanglingPods(ctx, podSyncWorkers)
 
-	log.G(ctx).Info("starting workers")
+	group, ctx := errgroup.WithContext(ctx)
+	log.G(ctx).Info("Starting provider to K8s sync workers")
+	for i := 0; i < podSyncWorkers; i++ {
+		workerID := strconv.Itoa(i)
+		group.Go(func() error {
+			pc.runProviderSyncWorker(ctx, workerID, podStatusQueue)
+			return nil
+		})
+	}
+
+	log.G(ctx).Info("Starting K8s to provider sync workers")
 	for id := 0; id < podSyncWorkers; id++ {
 		workerID := strconv.Itoa(id)
-		go wait.Until(func() {
+		group.Go(func() error {
 			// Use the worker's "index" as its ID so we can use it for tracing.
-			pc.runWorker(ctx, workerID, pc.k8sQ)
-		}, time.Second, ctx.Done())
+			pc.runK8sSyncWorker(ctx, workerID)
+			return nil
+		})
 	}
 
 	close(pc.ready)
 
 	log.G(ctx).Info("started workers")
 	<-ctx.Done()
+	podStatusQueue.ShutDown()
+	pc.k8sQ.ShutDown()
 	log.G(ctx).Info("shutting down workers")
 
-	return nil
+	return group.Wait()
 }
 
 // Ready returns a channel which gets closed once the PodController is ready to handle scheduled pods.
@@ -261,17 +269,17 @@ func (pc *PodController) Ready() <-chan struct{} {
 	return pc.ready
 }
 
-// runWorker is a long-running function that will continually call the processNextWorkItem function in order to read and process an item on the work queue.
-func (pc *PodController) runWorker(ctx context.Context, workerId string, q workqueue.RateLimitingInterface) {
-	for pc.processNextWorkItem(ctx, workerId, q) {
+// runK8sSyncWorker is a long-running function that will continually call the processNextWorkItem function in order to read and process an item on the work queue.
+func (pc *PodController) runK8sSyncWorker(ctx context.Context, workerId string) {
+	for pc.processNextK8sWorkItem(ctx, workerId, pc.k8sQ) {
 	}
 }
 
-// processNextWorkItem will read a single work item off the work queue and attempt to process it,by calling the syncHandler.
-func (pc *PodController) processNextWorkItem(ctx context.Context, workerId string, q workqueue.RateLimitingInterface) bool {
+// processNextK8sWorkItem will read a single work item off the work queue and attempt to process it,by calling the syncHandler.
+func (pc *PodController) processNextK8sWorkItem(ctx context.Context, workerId string, q workqueue.RateLimitingInterface) bool {
 
 	// We create a span only after popping from the queue so that we can get an adequate picture of how long it took to process the item.
-	ctx, span := trace.StartSpan(ctx, "processNextWorkItem")
+	ctx, span := trace.StartSpan(ctx, "processNextK8sWorkItem")
 	defer span.End()
 
 	// Add the ID of the current worker as an attribute to the current span.
