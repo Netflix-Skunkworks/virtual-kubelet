@@ -23,10 +23,11 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 	watchutils "k8s.io/client-go/tools/watch"
 	"k8s.io/klog"
-	ktesting "k8s.io/client-go/testing"
+	"k8s.io/client-go/informers"
 )
 
 var (
@@ -231,9 +232,19 @@ type system struct {
 	pc                  *PodController
 	client              *fake.Clientset
 	podControllerConfig PodControllerConfig
+
+	scmInformerFactory informers.SharedInformerFactory
+	podInformerFactory informers.SharedInformerFactory
+
 }
 
 func (s *system) start(ctx context.Context) chan error {
+	go s.scmInformerFactory.Start(ctx.Done())
+	go s.podInformerFactory.Start(ctx.Done())
+
+	s.podInformerFactory.WaitForCacheSync(ctx.Done())
+	s.scmInformerFactory.WaitForCacheSync(ctx.Done())
+
 	podControllerErrChan := make(chan error)
 	go func() {
 		podControllerErrChan <- s.pc.Run(ctx, podSyncWorkers)
@@ -277,15 +288,29 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 		return false, nil, nil
 	})
 
+	client.PrependWatchReactor("*", func(action ktesting.Action) (handled bool, ret watch.Interface, err error) {
+		log.G(ctx).WithField("action", action).Info("Handling watch reaction (prepended)")
+		return false, nil, nil
+	})
+
+	client.AddWatchReactor("*", func(action ktesting.Action) (handled bool, ret watch.Interface, err error) {
+		log.G(ctx).WithField("action", action).Info("Handling watch reaction (appended)")
+		return false, nil, nil
+	})
+
+	sys := &system{
+		client:  client,
+		retChan: make(chan error, 1),
+	}
 	// This is largely copy and pasted code from the root command
-	podInformerFactory := kubeinformers.NewSharedInformerFactoryWithOptions(
+	sys.podInformerFactory = kubeinformers.NewSharedInformerFactoryWithOptions(
 		client,
 		informerResyncPeriod,
 		kubeinformers.WithNamespace(testNamespace),
 	)
-	podInformer := podInformerFactory.Core().V1().Pods()
+	podInformer := sys.podInformerFactory.Core().V1().Pods()
 
-	scmInformerFactory := kubeinformers.NewSharedInformerFactory(client, informerResyncPeriod)
+	sys.scmInformerFactory = kubeinformers.NewSharedInformerFactory(client, informerResyncPeriod)
 
 	eb := record.NewBroadcaster()
 	eb.StartLogging(log.G(ctx).Infof)
@@ -294,13 +319,11 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 		logger: log.G(ctx),
 	}
 
-	secretInformer := scmInformerFactory.Core().V1().Secrets()
-	configMapInformer := scmInformerFactory.Core().V1().ConfigMaps()
-	serviceInformer := scmInformerFactory.Core().V1().Services()
-	sys := &system{
-		client:  client,
-		retChan: make(chan error, 1),
-		podControllerConfig: PodControllerConfig{
+	secretInformer := sys.scmInformerFactory.Core().V1().Secrets()
+	configMapInformer := sys.scmInformerFactory.Core().V1().ConfigMaps()
+	serviceInformer := sys.scmInformerFactory.Core().V1().Services()
+
+	sys.podControllerConfig = PodControllerConfig{
 			PodClient:         client.CoreV1(),
 			PodInformer:       podInformer,
 			EventRecorder:     fakeRecorder,
@@ -308,8 +331,7 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 			ConfigMapInformer: configMapInformer,
 			SecretInformer:    secretInformer,
 			ServiceInformer:   serviceInformer,
-		},
-	}
+		}
 
 	var err error
 	sys.pc, err = NewPodController(sys.podControllerConfig)
@@ -317,8 +339,21 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 		return err
 	}
 
-	go scmInformerFactory.Start(ctx.Done())
-	go podInformerFactory.Start(ctx.Done())
+	go func() {
+		time.Sleep(time.Second)
+		if ctx.Err() != nil {
+			return
+		}
+		t := time.NewTicker(time.Second)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+			}
+		}
+	}()
 
 	f(ctx, sys)
 
@@ -404,6 +439,7 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 	// Create the Pod
 	_, e := s.client.CoreV1().Pods(testNamespace).Create(p)
 	assert.NilError(t, e)
+	log.G(ctx).Info("Created pod")
 
 	// This will return once
 	select {

@@ -171,7 +171,7 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		ready:           make(chan struct{}),
 		recorder:        cfg.EventRecorder,
 
-		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
+		k8sQ: workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
 	}
 
 	return pc, nil
@@ -197,6 +197,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	// synthetic add events at this point.
 	pc.podsInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: func(pod interface{}) {
+			log.G(ctx).WithField("pod", pod).Info("Pod Added")
 			if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
 				log.G(ctx).Error(err)
 			} else {
@@ -207,6 +208,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 			// Create a copy of the old and new pod objects so we don't mutate the cache.
 			oldPod := oldObj.(*corev1.Pod).DeepCopy()
 			newPod := newObj.(*corev1.Pod).DeepCopy()
+			log.G(ctx).WithField("oldPod", oldPod).WithField("newPod", newPod).Info("Pod changed")
 			// We want to check if the two objects differ in anything other than their resource versions.
 			// Hence, we make them equal so that this change isn't picked up by reflect.DeepEqual.
 			newPod.ResourceVersion = oldPod.ResourceVersion
@@ -223,6 +225,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 			}
 		},
 		DeleteFunc: func(pod interface{}) {
+			log.G(ctx).WithField("pod", pod).Info("Pod removed")
 			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pod); err != nil {
 				log.G(ctx).Error(err)
 			} else {
