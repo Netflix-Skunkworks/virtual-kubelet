@@ -20,7 +20,8 @@ import (
 	"reflect"
 	"strconv"
 	"sync"
-	"time"
+
+	"golang.org/x/sync/errgroup"
 
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
@@ -29,7 +30,6 @@ import (
 	"github.com/virtual-kubelet/virtual-kubelet/trace"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/util/wait"
 	corev1informers "k8s.io/client-go/informers/core/v1"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
 	corev1listers "k8s.io/client-go/listers/core/v1"
@@ -219,9 +219,8 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	defer pc.k8sQ.ShutDown()
 
 	podStatusQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider")
-	pc.runSyncFromProvider(ctx, podStatusQueue)
-	pc.runProviderSyncWorkers(ctx, podStatusQueue, podSyncWorkers)
 	defer podStatusQueue.ShutDown()
+	pc.runSyncFromProvider(ctx, podStatusQueue)
 
 	// Wait for the caches to be synced *before* starting workers.
 	if ok := cache.WaitForCacheSync(ctx.Done(), pc.podsInformer.Informer().HasSynced); !ok {
@@ -235,12 +234,21 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	pc.deleteDanglingPods(ctx, podSyncWorkers)
 
 	log.G(ctx).Info("starting workers")
+	group, ctx := errgroup.WithContext(ctx)
+	for i := 0; i < podSyncWorkers; i++ {
+		workerID := strconv.Itoa(i)
+		group.Go(func() error {
+			pc.runSyncPodStatusFromProviderWorker(ctx, workerID, podStatusQueue)
+			return nil
+		})
+	}
+
 	for id := 0; id < podSyncWorkers; id++ {
 		workerID := strconv.Itoa(id)
-		go wait.Until(func() {
-			// Use the worker's "index" as its ID so we can use it for tracing.
-			pc.runWorker(ctx, workerID, pc.k8sQ)
-		}, time.Second, ctx.Done())
+		group.Go(func() error {
+			pc.runSyncPodsFromKubernetesWorker(ctx, workerID, pc.k8sQ)
+			return nil
+		})
 	}
 
 	close(pc.ready)
@@ -248,8 +256,10 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	log.G(ctx).Info("started workers")
 	<-ctx.Done()
 	log.G(ctx).Info("shutting down workers")
+	pc.k8sQ.ShutDown()
+	podStatusQueue.ShutDown()
 
-	return nil
+	return group.Wait()
 }
 
 // Ready returns a channel which gets closed once the PodController is ready to handle scheduled pods.
@@ -260,7 +270,7 @@ func (pc *PodController) Ready() <-chan struct{} {
 }
 
 // runWorker is a long-running function that will continually call the processNextWorkItem function in order to read and process an item on the work queue.
-func (pc *PodController) runWorker(ctx context.Context, workerId string, q workqueue.RateLimitingInterface) {
+func (pc *PodController) runSyncPodsFromKubernetesWorker(ctx context.Context, workerId string, q workqueue.RateLimitingInterface) {
 	for pc.processNextWorkItem(ctx, workerId, q) {
 	}
 }
