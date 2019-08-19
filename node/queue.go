@@ -31,7 +31,7 @@ const (
 	maxRetries = 20
 )
 
-type queueHandler func(ctx context.Context, key string) error
+type queueHandler func(ctx context.Context, key string, willRetry bool) error
 
 func handleQueueItem(ctx context.Context, q workqueue.RateLimitingInterface, handler queueHandler) bool {
 	ctx, span := trace.StartSpan(ctx, "handleQueueItem")
@@ -66,8 +66,9 @@ func handleQueueItem(ctx context.Context, q workqueue.RateLimitingInterface, han
 		// Add the current key as an attribute to the current span.
 		ctx = span.WithField(ctx, "key", key)
 		// Run the syncHandler, passing it the namespace/name string of the Pod resource to be synced.
-		if err := handler(ctx, key); err != nil {
-			if q.NumRequeues(key) < maxRetries {
+		willRetry := q.NumRequeues(key) < maxRetries
+		if err := handler(ctx, key, willRetry); err != nil {
+			if willRetry {
 				// Put the item back on the work queue to handle any transient errors.
 				log.G(ctx).WithError(err).Warnf("requeuing %q due to failed sync", key)
 				q.AddRateLimited(key)
@@ -92,35 +93,35 @@ func handleQueueItem(ctx context.Context, q workqueue.RateLimitingInterface, han
 	return true
 }
 
-func (pc *PodController) runProviderSyncWorkers(ctx context.Context, q workqueue.RateLimitingInterface, numWorkers int) {
+func (pc *PodController) runProviderSyncWorkers(ctx context.Context, numWorkers int) {
 	for i := 0; i < numWorkers; i++ {
 		go func(index int) {
 			workerID := strconv.Itoa(index)
-			pc.runProviderSyncWorker(ctx, workerID, q)
+			pc.runProviderSyncWorker(ctx, workerID)
 		}(i)
 	}
 }
 
-func (pc *PodController) runProviderSyncWorker(ctx context.Context, workerID string, q workqueue.RateLimitingInterface) {
-	for pc.processPodStatusUpdate(ctx, workerID, q) {
+func (pc *PodController) runProviderSyncWorker(ctx context.Context, workerID string) {
+	for pc.processPodStatusUpdate(ctx, workerID) {
 	}
 }
 
-func (pc *PodController) processPodStatusUpdate(ctx context.Context, workerID string, q workqueue.RateLimitingInterface) bool {
+func (pc *PodController) processPodStatusUpdate(ctx context.Context, workerID string) bool {
 	ctx, span := trace.StartSpan(ctx, "processPodStatusUpdate")
 	defer span.End()
 
 	// Add the ID of the current worker as an attribute to the current span.
 	ctx = span.WithField(ctx, "workerID", workerID)
 
-	return handleQueueItem(ctx, q, pc.podStatusHandler)
+	return handleQueueItem(ctx, pc.podStatusQueue, pc.podStatusHandler)
 }
 
 // providerSyncLoop syncronizes pod states from the provider back to kubernetes
 // Deprecated: This is only used when the provider does not support async updates
 // Providers should implement async update support, even if it just means copying
 // something like this in.
-func (pc *PodController) providerSyncLoop(ctx context.Context, q workqueue.RateLimitingInterface) {
+func (pc *PodController) providerSyncLoop(ctx context.Context) {
 	const sleepTime = 5 * time.Second
 
 	t := time.NewTimer(sleepTime)
@@ -134,7 +135,7 @@ func (pc *PodController) providerSyncLoop(ctx context.Context, q workqueue.RateL
 			t.Stop()
 
 			ctx, span := trace.StartSpan(ctx, "syncActualState")
-			pc.updatePodStatuses(ctx, q)
+			pc.updatePodStatuses(ctx)
 			span.End()
 
 			// restart the timer
@@ -143,12 +144,12 @@ func (pc *PodController) providerSyncLoop(ctx context.Context, q workqueue.RateL
 	}
 }
 
-func (pc *PodController) runSyncFromProvider(ctx context.Context, q workqueue.RateLimitingInterface) {
+func (pc *PodController) runSyncFromProvider(ctx context.Context) {
 	if pn, ok := pc.provider.(PodNotifier); ok {
 		pn.NotifyPods(ctx, func(pod *corev1.Pod) {
-			enqueuePodStatusUpdate(ctx, q, pod)
+			enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
 		})
 	} else {
-		go pc.providerSyncLoop(ctx, q)
+		go pc.providerSyncLoop(ctx)
 	}
 }

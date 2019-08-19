@@ -18,6 +18,8 @@ import (
 	"context"
 	"testing"
 
+	"k8s.io/client-go/tools/cache"
+
 	pkgerrors "github.com/pkg/errors"
 	"github.com/virtual-kubelet/virtual-kubelet/errdefs"
 	testutil "github.com/virtual-kubelet/virtual-kubelet/internal/test/util"
@@ -174,7 +176,9 @@ func TestPodCreateNewPod(t *testing.T) {
 		},
 	}
 
-	err := svr.createOrUpdatePod(context.Background(), pod.DeepCopy())
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	assert.NilError(t, err)
+	err = svr.createOrUpdatePod(context.Background(), pod.DeepCopy(), key)
 
 	assert.Check(t, is.Nil(err))
 	// createOrUpdate called CreatePod but did not call UpdatePod because the pod did not exist
@@ -203,7 +207,9 @@ func TestPodUpdateExisting(t *testing.T) {
 		},
 	}
 
-	err := svr.createOrUpdatePod(context.Background(), pod.DeepCopy())
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	assert.NilError(t, err)
+	err = svr.createOrUpdatePod(context.Background(), pod.DeepCopy(), key)
 	assert.Check(t, is.Nil(err))
 	assert.Check(t, is.Equal(svr.mock.creates.read(), 1))
 	assert.Check(t, is.Equal(svr.mock.updates.read(), 0))
@@ -226,7 +232,9 @@ func TestPodUpdateExisting(t *testing.T) {
 		},
 	}
 
-	err = svr.createOrUpdatePod(context.Background(), pod2.DeepCopy())
+	key2, err := cache.MetaNamespaceKeyFunc(pod2)
+	assert.NilError(t, err)
+	err = svr.createOrUpdatePod(context.Background(), pod2.DeepCopy(), key2)
 	assert.Check(t, is.Nil(err))
 
 	// createOrUpdate didn't call CreatePod but did call UpdatePod because the spec changed
@@ -255,12 +263,15 @@ func TestPodNoSpecChange(t *testing.T) {
 		},
 	}
 
-	err := svr.createOrUpdatePod(context.Background(), pod.DeepCopy())
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	assert.NilError(t, err)
+
+	err = svr.createOrUpdatePod(context.Background(), pod.DeepCopy(), key)
 	assert.Check(t, is.Nil(err))
 	assert.Check(t, is.Equal(svr.mock.creates.read(), 1))
 	assert.Check(t, is.Equal(svr.mock.updates.read(), 0))
 
-	err = svr.createOrUpdatePod(context.Background(), pod.DeepCopy())
+	err = svr.createOrUpdatePod(context.Background(), pod.DeepCopy(), key)
 	assert.Check(t, is.Nil(err))
 
 	// createOrUpdate didn't call CreatePod or UpdatePod, spec didn't change
@@ -303,11 +314,13 @@ func TestPodDelete(t *testing.T) {
 			assert.NilError(t, err)
 
 			ctx := context.Background()
-			err = c.createOrUpdatePod(ctx, p.DeepCopy()) // make sure it's actually created
+			key, err := cache.MetaNamespaceKeyFunc(p)
+			assert.NilError(t, err)
+			err = c.createOrUpdatePod(ctx, p.DeepCopy(), key) // make sure it's actually created
 			assert.NilError(t, err)
 			assert.Check(t, is.Equal(c.mock.creates.read(), 1))
 
-			err = c.deletePod(ctx, pod.Namespace, pod.Name)
+			err = c.deletePod(ctx, pod.Namespace, pod.Name, key, false)
 			assert.Equal(t, pkgerrors.Cause(err), err)
 
 			var expectDeletes int

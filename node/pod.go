@@ -47,7 +47,7 @@ func addPodAttributes(ctx context.Context, span trace.Span, pod *corev1.Pod) con
 	})
 }
 
-func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod) error {
+func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod, key string) error {
 
 	ctx, span := trace.StartSpan(ctx, "createOrUpdatePod")
 	defer span.End()
@@ -86,6 +86,7 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod)
 			pc.handleProviderError(ctx, span, origErr, pod)
 			return origErr
 		}
+		pc.lastPodCreatedInProvider.Store(key, pod)
 		log.G(ctx).Info("Created pod in provider")
 	}
 	return nil
@@ -151,9 +152,19 @@ func (pc *PodController) handleProviderError(ctx context.Context, span trace.Spa
 	span.SetStatus(origErr)
 }
 
-func (pc *PodController) deletePod(ctx context.Context, namespace, name string) error {
+func (pc *PodController) deletePod(ctx context.Context, namespace, name, key string, willRetry bool) (retErr error) {
 	ctx, span := trace.StartSpan(ctx, "deletePod")
 	defer span.End()
+
+	defer func() {
+		if !willRetry || retErr == nil {
+			pc.lastPodCreatedInProvider.Delete(key)
+		}
+	}()
+
+	if _, ok := pc.lastPodCreatedInProvider.Load(key); !ok {
+		return nil
+	}
 
 	pod, err := pc.provider.GetPod(ctx, namespace, name)
 	if err != nil {
@@ -210,7 +221,7 @@ func (pc *PodController) forceDeletePodResource(ctx context.Context, namespace, 
 }
 
 // updatePodStatuses syncs the providers pod status with the kubernetes pod status.
-func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.RateLimitingInterface) {
+func (pc *PodController) updatePodStatuses(ctx context.Context) {
 	ctx, span := trace.StartSpan(ctx, "updatePodStatuses")
 	defer span.End()
 
@@ -226,7 +237,7 @@ func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.Rate
 
 	for _, pod := range pods {
 		if !shouldSkipPodStatusUpdate(pod) {
-			enqueuePodStatusUpdate(ctx, q, pod)
+			enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
 		}
 	}
 }
@@ -301,7 +312,7 @@ func enqueuePodStatusUpdate(ctx context.Context, q workqueue.RateLimitingInterfa
 	}
 }
 
-func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retErr error) {
+func (pc *PodController) podStatusHandler(ctx context.Context, key string, willRetry bool) (retErr error) {
 	ctx, span := trace.StartSpan(ctx, "podStatusHandler")
 	defer span.End()
 

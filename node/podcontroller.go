@@ -108,7 +108,10 @@ type PodController struct {
 
 	resourceManager *manager.ResourceManager
 
-	k8sQ workqueue.RateLimitingInterface
+	k8sQ           workqueue.RateLimitingInterface
+	podStatusQueue workqueue.RateLimitingInterface
+
+	lastPodCreatedInProvider sync.Map
 }
 
 // PodControllerConfig is used to configure a new PodController.
@@ -171,6 +174,7 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		ready:           make(chan struct{}),
 		recorder:        cfg.EventRecorder,
 		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
+		podStatusQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider"),
 	}
 
 	// Set up event handlers for when Pod resources change.
@@ -218,10 +222,9 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	defer pc.k8sQ.ShutDown()
 
-	podStatusQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider")
-	pc.runSyncFromProvider(ctx, podStatusQueue)
-	pc.runProviderSyncWorkers(ctx, podStatusQueue, podSyncWorkers)
-	defer podStatusQueue.ShutDown()
+	pc.runSyncFromProvider(ctx)
+	pc.runProviderSyncWorkers(ctx, podSyncWorkers)
+	defer pc.podStatusQueue.ShutDown()
 
 	// Wait for the caches to be synced *before* starting workers.
 	if ok := cache.WaitForCacheSync(ctx.Done(), pc.podsInformer.Informer().HasSynced); !ok {
@@ -278,7 +281,7 @@ func (pc *PodController) processNextWorkItem(ctx context.Context, workerId strin
 }
 
 // syncHandler compares the actual state with the desired, and attempts to converge the two.
-func (pc *PodController) syncHandler(ctx context.Context, key string) error {
+func (pc *PodController) syncHandler(ctx context.Context, key string, willRetry bool) error {
 	ctx, span := trace.StartSpan(ctx, "syncHandler")
 	defer span.End()
 
@@ -305,7 +308,7 @@ func (pc *PodController) syncHandler(ctx context.Context, key string) error {
 		}
 		// At this point we know the Pod resource doesn't exist, which most probably means it was deleted.
 		// Hence, we must delete it from the provider if it still exists there.
-		if err := pc.deletePod(ctx, namespace, name); err != nil {
+		if err := pc.deletePod(ctx, namespace, name, key, willRetry); err != nil {
 			err := pkgerrors.Wrapf(err, "failed to delete pod %q in the provider", loggablePodNameFromCoordinates(namespace, name))
 			span.SetStatus(err)
 			return err
@@ -313,11 +316,11 @@ func (pc *PodController) syncHandler(ctx context.Context, key string) error {
 		return nil
 	}
 	// At this point we know the Pod resource has either been created or updated (which includes being marked for deletion).
-	return pc.syncPodInProvider(ctx, pod)
+	return pc.syncPodInProvider(ctx, pod, key, willRetry)
 }
 
 // syncPodInProvider tries and reconciles the state of a pod by comparing its Kubernetes representation and the provider's representation.
-func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod) error {
+func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod, key string, willRetry bool) error {
 	ctx, span := trace.StartSpan(ctx, "syncPodInProvider")
 	defer span.End()
 
@@ -327,7 +330,7 @@ func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod)
 	// Check whether the pod has been marked for deletion.
 	// If it does, guarantee it is deleted in the provider and Kubernetes.
 	if pod.DeletionTimestamp != nil {
-		if err := pc.deletePod(ctx, pod.Namespace, pod.Name); err != nil {
+		if err := pc.deletePod(ctx, pod.Namespace, pod.Name, key, willRetry); err != nil {
 			err := pkgerrors.Wrapf(err, "failed to delete pod %q in the provider", loggablePodName(pod))
 			span.SetStatus(err)
 			return err
@@ -342,7 +345,7 @@ func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod)
 	}
 
 	// Create or update the pod in the provider.
-	if err := pc.createOrUpdatePod(ctx, pod); err != nil {
+	if err := pc.createOrUpdatePod(ctx, pod, key); err != nil {
 		err := pkgerrors.Wrapf(err, "failed to sync pod %q in the provider", loggablePodName(pod))
 		span.SetStatus(err)
 		return err
@@ -405,7 +408,7 @@ func (pc *PodController) deleteDanglingPods(ctx context.Context, threadiness int
 			// Add the pod's attributes to the current span.
 			ctx = addPodAttributes(ctx, span, pod)
 			// Actually delete the pod.
-			if err := pc.deletePod(ctx, pod.Namespace, pod.Name); err != nil {
+			if err := pc.provider.DeletePod(ctx, pod.DeepCopy()); err != nil {
 				span.SetStatus(err)
 				log.G(ctx).Errorf("failed to delete pod %q in provider", loggablePodName(pod))
 			} else {

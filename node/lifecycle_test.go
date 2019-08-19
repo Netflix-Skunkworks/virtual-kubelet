@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,11 +24,12 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	watchutils "k8s.io/client-go/tools/watch"
+	"k8s.io/client-go/util/workqueue"
 	"k8s.io/klog"
-	ktesting "k8s.io/client-go/testing"
 )
 
 var (
@@ -142,7 +144,7 @@ func TestPodLifecycle(t *testing.T) {
 	t.Run("createStartDeleteScenarioWithDeletionRandomError", func(t *testing.T) {
 		mp := newMockProvider()
 		deletionFunc := func(ctx context.Context, watcher watch.Interface) error {
-			return mp.attemptedDeletes.until(ctx, func(v int) bool { return v >= 2 })
+			return mp.attemptedDeletes.until(ctx, func(v int) bool { return v >= maxRetries })
 		}
 		mp.errorOnDelete = errors.New("random error")
 		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
@@ -257,6 +259,32 @@ func (s *system) start(ctx context.Context) chan error {
 	return s.retChan
 }
 
+type shortCircuitRateLimiter struct {
+	lock     sync.RWMutex
+	requeues map[interface{}]int
+}
+
+// When gets an item and gets to decide how long that item should wait
+func (s *shortCircuitRateLimiter) When(item interface{}) time.Duration {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	queues := s.requeues[item]
+	s.requeues[item] = queues + 1
+	return time.Duration(1)
+}
+
+func (s *shortCircuitRateLimiter) Forget(item interface{}) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	delete(s.requeues, item)
+}
+
+func (s *shortCircuitRateLimiter) NumRequeues(item interface{}) int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return s.requeues[item]
+}
+
 func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunction) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -314,6 +342,16 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 	if err != nil {
 		return err
 	}
+
+	// We do this because some tests make it so we require going through all attempts to requeue an item.
+	// If we wait based on the built-in rate limiter, the tests end up timing out. This makes it so that
+	// items are immediately requeued.
+	sys.pc.podStatusQueue = workqueue.NewNamedRateLimitingQueue(&shortCircuitRateLimiter{
+		requeues: make(map[interface{}]int),
+	}, "syncPodStatusFromProvider")
+	sys.pc.k8sQ = workqueue.NewNamedRateLimitingQueue(&shortCircuitRateLimiter{
+		requeues: make(map[interface{}]int),
+	}, "syncPodsFromKubernetes")
 
 	go sharedInformerFactory.Start(ctx.Done())
 	sharedInformerFactory.WaitForCacheSync(ctx.Done())
@@ -480,6 +518,16 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 	case err = <-watchErrCh:
 		assert.NilError(t, err)
 
+	}
+
+	pods := []interface{}{}
+	s.pc.lastPodCreatedInProvider.Range(func(key, pod interface{}) bool {
+		pods = append(pods, pod)
+		return true
+	})
+
+	if len(pods) > 0 {
+		t.Fatalf("Found pods %v still in pod controller, after deletion", pods)
 	}
 }
 
