@@ -212,6 +212,7 @@ func (p *mockV0Provider) DeletePod(ctx context.Context, pod *v1.Pod) (err error)
 	}
 
 	p.notifier(pod)
+	p.pods.Store(key, pod)
 	// TODO (Sargun): Eventually delete the pod from the map. We cannot right now, because GetPodStatus can / will
 	// be called momentarily later.
 	return nil

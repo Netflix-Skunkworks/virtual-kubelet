@@ -111,7 +111,16 @@ type PodController struct {
 	k8sQ           workqueue.RateLimitingInterface
 	podStatusQueue workqueue.RateLimitingInterface
 
-	lastPodCreatedInProvider sync.Map
+	// lastPodReceivedFromProvider keeps track of pod (statuses) received from the provider. We prevent leaks two
+	// ways:
+	// 1. If the pod is deleted in API server, we delete the pod (status) from this map
+	// 2. If the provider sends us a status update _after_ the pod is deleted from API Server, upon
+	//    later processing, we delete the pod from api server entirely.
+	lastPodReceivedFromProvider sync.Map
+	// deletedPods keeps track of pods we've deleted locally
+	deletedPods sync.Map
+
+	sleepTime time.Duration
 }
 
 // PodControllerConfig is used to configure a new PodController.
@@ -135,6 +144,8 @@ type PodControllerConfig struct {
 	ConfigMapInformer corev1informers.ConfigMapInformer
 	SecretInformer    corev1informers.SecretInformer
 	ServiceInformer   corev1informers.ServiceInformer
+
+	LegacyPodSyncSleepTime time.Duration
 }
 
 func NewPodController(cfg PodControllerConfig) (*PodController, error) {
@@ -175,6 +186,7 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		recorder:        cfg.EventRecorder,
 		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
 		podStatusQueue:  workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider"),
+		sleepTime: cfg.LegacyPodSyncSleepTime,
 	}
 
 	// Set up event handlers for when Pod resources change.
@@ -209,6 +221,7 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pod); err != nil {
 				log.L.Error(err)
 			} else {
+				pc.lastPodReceivedFromProvider.Delete(key)
 				pc.k8sQ.AddRateLimited(key)
 			}
 		},
@@ -221,9 +234,6 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 // It will block until the context is cancelled, at which point it will shutdown the work queue and wait for workers to finish processing their current work items.
 func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 	defer pc.k8sQ.ShutDown()
-
-	pc.runSyncFromProvider(ctx)
-	pc.runProviderSyncWorkers(ctx, podSyncWorkers)
 	defer pc.podStatusQueue.ShutDown()
 
 	// Wait for the caches to be synced *before* starting workers.
@@ -231,6 +241,8 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
 		return pkgerrors.New("failed to wait for caches to sync")
 	}
 	log.G(ctx).Info("Pod cache in-sync")
+	pc.runSyncFromProvider(ctx)
+	pc.runProviderSyncWorkers(ctx, podSyncWorkers)
 
 	// Perform a reconciliation step that deletes any dangling pods from the provider.
 	// This happens only when the virtual-kubelet is starting, and operates on a "best-effort" basis.
@@ -306,6 +318,13 @@ func (pc *PodController) syncHandler(ctx context.Context, key string, willRetry 
 			span.SetStatus(err)
 			return err
 		}
+		// If we've already deleted this pod, then we don't need to delete it "again". Instead, since it's been deleted
+		// from api server, we can finally remove this from the deletedPods set because now we know we wont get any
+		// more API status updates
+		if _, ok := pc.deletedPods.Load(key); ok {
+			pc.deletedPods.Delete(key)
+			return nil
+		}
 		// At this point we know the Pod resource doesn't exist, which most probably means it was deleted.
 		// Hence, we must delete it from the provider if it still exists there.
 		if err := pc.deletePod(ctx, namespace, name, key, willRetry); err != nil {
@@ -335,6 +354,7 @@ func (pc *PodController) syncPodInProvider(ctx context.Context, pod *corev1.Pod,
 			span.SetStatus(err)
 			return err
 		}
+		pc.deletedPods.Store(key, struct{}{})
 		return nil
 	}
 

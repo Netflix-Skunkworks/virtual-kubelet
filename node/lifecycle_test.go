@@ -96,15 +96,12 @@ func TestPodLifecycle(t *testing.T) {
 
 	ctx = log.WithLogger(ctx, log.L)
 
-	// isPodDeletedPermanentlyFunc is a condition func that waits until the pod is _deleted_, which is the VK's
-	// action when the pod is deleted from the provider
-	isPodDeletedPermanentlyFunc := func(ctx context.Context, watcher watch.Interface) error {
+	// isPodInTerminalState is a condition func that waits until the pod is succeeded or failed
+	isPodInTerminalState := func(ctx context.Context, watcher watch.Interface) error {
 		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher, func(ev watch.Event) (bool, error) {
 			log.G(ctx).WithField("event", ev).Info("got event")
-			// TODO(Sargun): The pod should have transitioned into some status around failed / succeeded
-			// prior to being deleted.
-			// In addition, we should check if the deletion timestamp gets set
-			return ev.Type == watch.Deleted, nil
+			pod := ev.Object.(*corev1.Pod)
+			return pod.Status.Phase == corev1.PodFailed || pod.Status.Phase == corev1.PodSucceeded, nil
 		})
 		return watchErr
 	}
@@ -115,7 +112,7 @@ func TestPodLifecycle(t *testing.T) {
 
 		t.Run("mockProvider", func(t *testing.T) {
 			assert.NilError(t, wireUpSystem(ctx, newMockProvider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalState)
 			}))
 		})
 
@@ -124,7 +121,7 @@ func TestPodLifecycle(t *testing.T) {
 		}
 		t.Run("mockV0Provider", func(t *testing.T) {
 			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalState)
 			}))
 		})
 	})
@@ -135,7 +132,7 @@ func TestPodLifecycle(t *testing.T) {
 		mp := newMockProvider()
 		mp.errorOnDelete = errdefs.NotFound("not found")
 		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-			testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+			testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalState)
 		}))
 	})
 
@@ -334,6 +331,7 @@ func wireUpSystem(ctx context.Context, provider PodLifecycleHandler, f testFunct
 			ConfigMapInformer: configMapInformer,
 			SecretInformer:    secretInformer,
 			ServiceInformer:   serviceInformer,
+			LegacyPodSyncSleepTime: time.Second,
 		},
 	}
 
@@ -467,6 +465,7 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 			// Wait for the pod to be started
 			func(ev watch.Event) (bool, error) {
 				pod := ev.Object.(*corev1.Pod)
+				log.G(ctx).WithField("pod", pod).Debug("Received update while waiting for pod to become running")
 				return pod.Status.Phase == corev1.PodRunning, nil
 			})
 
@@ -486,6 +485,7 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 		assert.NilError(t, err)
 		t.Fatal("Pod controller terminated early")
 	}
+	log.G(ctx).Debug("Saw pod running")
 
 	// Setup a watch prior to pod deletion
 	watcher, err = s.client.CoreV1().Pods(testNamespace).Watch(listOptions)
@@ -518,16 +518,6 @@ func testCreateStartDeleteScenario(ctx context.Context, t *testing.T, s *system,
 	case err = <-watchErrCh:
 		assert.NilError(t, err)
 
-	}
-
-	pods := []interface{}{}
-	s.pc.lastPodCreatedInProvider.Range(func(key, pod interface{}) bool {
-		pods = append(pods, pod)
-		return true
-	})
-
-	if len(pods) > 0 {
-		t.Fatalf("Found pods %v still in pod controller, after deletion", pods)
 	}
 }
 

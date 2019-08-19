@@ -86,7 +86,6 @@ func (pc *PodController) createOrUpdatePod(ctx context.Context, pod *corev1.Pod,
 			pc.handleProviderError(ctx, span, origErr, pod)
 			return origErr
 		}
-		pc.lastPodCreatedInProvider.Store(key, pod)
 		log.G(ctx).Info("Created pod in provider")
 	}
 	return nil
@@ -156,46 +155,53 @@ func (pc *PodController) deletePod(ctx context.Context, namespace, name, key str
 	ctx, span := trace.StartSpan(ctx, "deletePod")
 	defer span.End()
 
-	defer func() {
-		if !willRetry || retErr == nil {
-			pc.lastPodCreatedInProvider.Delete(key)
-		}
-	}()
-
-	if _, ok := pc.lastPodCreatedInProvider.Load(key); !ok {
-		return nil
-	}
 
 	pod, err := pc.provider.GetPod(ctx, namespace, name)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-			return pc.forceDeletePodResource(ctx, namespace, name)
-		}
-		return err
-	}
-
 	// NOTE: Some providers return a non-nil error in their GetPod implementation when the pod is not found while some other don't.
-	if pod == nil {
-		// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-		return pc.forceDeletePodResource(ctx, namespace, name)
+	if errdefs.IsNotFound(err) || pod == nil {
+		lastObj, ok := pc.lastPodReceivedFromProvider.Load(key)
+		if ok {
+			lastPodReceivedFromProvider := lastObj.(*corev1.Pod)
+			if lastPodReceivedFromProvider.Status.Phase == corev1.PodSucceeded || lastPodReceivedFromProvider.Status.Phase == corev1.PodFailed {
+				return nil
+			}
+		}
+	}
+	if err != nil {
+		return err
 	}
 
 	ctx = addPodAttributes(ctx, span, pod)
 
 	var delErr error
-	if delErr = pc.provider.DeletePod(ctx, pod.DeepCopy()); delErr != nil && !errdefs.IsNotFound(delErr) {
+	if delErr = pc.provider.DeletePod(ctx, pod.DeepCopy()); errdefs.IsNotFound(delErr) {
+		log.G(ctx).Debug("Pod not found in provider")
+		newPod := pod.DeepCopy()
+		// Set the pod to failed, this makes sure if the underlying container implementation is gone that a new pod will be created.
+		newPod.Status.Phase = corev1.PodFailed
+		newPod.Status.Reason = "NotFound"
+		pod.Status.Message = "The pod status was not found and may have been deleted from the provider"
+		for i, c := range newPod.Status.ContainerStatuses {
+			newPod.Status.ContainerStatuses[i].State.Terminated = &corev1.ContainerStateTerminated{
+				ExitCode:    -137,
+				Reason:      "NotFound",
+				Message:     "Container was not found and was likely deleted",
+				FinishedAt:  metav1.NewTime(time.Now()),
+				StartedAt:   c.State.Running.StartedAt,
+				ContainerID: c.ContainerID,
+			}
+			newPod.Status.ContainerStatuses[i].State.Running = nil
+		}
+
+		pc.client.Pods(pod.Namespace).UpdateStatus(newPod)
+
+		return nil
+	} else if delErr != nil {
 		span.SetStatus(delErr)
 		return delErr
 	}
 
 	log.G(ctx).Debug("Deleted pod from provider")
-
-	if err := pc.forceDeletePodResource(ctx, namespace, name); err != nil {
-		span.SetStatus(err)
-		return err
-	}
-	log.G(ctx).Info("Deleted pod from Kubernetes")
 
 	return nil
 }
@@ -236,60 +242,42 @@ func (pc *PodController) updatePodStatuses(ctx context.Context) {
 	ctx = span.WithField(ctx, "nPods", int64(len(pods)))
 
 	for _, pod := range pods {
-		if !shouldSkipPodStatusUpdate(pod) {
-			enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
+
+		status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
+		if errors.IsNotFound(err) {
+			continue
+		} else if  err != nil {
+			log.G(ctx).WithFields(map[string]interface{}{
+				"namespace": pod.Namespace,
+				"name": pod.Name,
+			}).WithError(err).Error("Could not fetch pod status")
 		}
+		pod = pod.DeepCopy()
+		pod.Status = *status
+		log.G(ctx).WithField("status", status).Debug()
+		pc.enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
 	}
 }
 
-func shouldSkipPodStatusUpdate(pod *corev1.Pod) bool {
-	return pod.Status.Phase == corev1.PodSucceeded ||
-		pod.Status.Phase == corev1.PodFailed ||
-		pod.Status.Reason == podStatusReasonProviderFailed
-}
-
-func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) error {
-	if shouldSkipPodStatusUpdate(pod) {
-		return nil
-	}
-
+// updatePodStatus is called with the last pod in the k8s API server.
+func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod, key string) error {
 	ctx, span := trace.StartSpan(ctx, "updatePodStatus")
 	defer span.End()
 	ctx = addPodAttributes(ctx, span, pod)
 
-	status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
-	if err != nil && !errdefs.IsNotFound(err) {
-		span.SetStatus(err)
-		return pkgerrors.Wrap(err, "error retrieving pod status")
+	lastObj, ok := pc.lastPodReceivedFromProvider.Load(key)
+	// This really should not happen
+	if !ok {
+		panic("Pod Controller state inconsistent, pod status not found during update processing")
 	}
+	lastPod := lastObj.(*corev1.Pod)
 
 	// Do not modify the pod that we got from the cache
 	pod = pod.DeepCopy()
 
-	// Update the pod's status
-	if status != nil {
-		pod.Status = *status
-	} else {
-		// Only change the status when the pod was already up
-		// Only doing so when the pod was successfully running makes sure we don't run into race conditions during pod creation.
-		if pod.Status.Phase == corev1.PodRunning || pod.ObjectMeta.CreationTimestamp.Add(time.Minute).Before(time.Now()) {
-			// Set the pod to failed, this makes sure if the underlying container implementation is gone that a new pod will be created.
-			pod.Status.Phase = corev1.PodFailed
-			pod.Status.Reason = "NotFound"
-			pod.Status.Message = "The pod status was not found and may have been deleted from the provider"
-			for i, c := range pod.Status.ContainerStatuses {
-				pod.Status.ContainerStatuses[i].State.Terminated = &corev1.ContainerStateTerminated{
-					ExitCode:    -137,
-					Reason:      "NotFound",
-					Message:     "Container was not found and was likely deleted",
-					FinishedAt:  metav1.NewTime(time.Now()),
-					StartedAt:   c.State.Running.StartedAt,
-					ContainerID: c.ContainerID,
-				}
-				pod.Status.ContainerStatuses[i].State.Running = nil
-			}
-		}
-	}
+	// update the pod we got from the cache with the pod status of the pod we got from the provider
+	oldStatus := pod.Status
+	pod.Status = lastPod.Status
 
 	if _, err := pc.client.Pods(pod.Namespace).UpdateStatus(pod); err != nil {
 		span.SetStatus(err)
@@ -299,15 +287,32 @@ func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) e
 	log.G(ctx).WithFields(log.Fields{
 		"new phase":  string(pod.Status.Phase),
 		"new reason": pod.Status.Reason,
+		"old phase":  string(oldStatus.Phase),
+		"old reason": oldStatus.Reason,
 	}).Debug("Updated pod status in kubernetes")
 
 	return nil
 }
 
-func enqueuePodStatusUpdate(ctx context.Context, q workqueue.RateLimitingInterface, pod *corev1.Pod) {
+func (pc *PodController) enqueuePodStatusUpdate(ctx context.Context, q workqueue.RateLimitingInterface, pod *corev1.Pod) {
 	if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
 		log.G(ctx).WithError(err).WithField("method", "enqueuePodStatusUpdate").Error("Error getting pod meta namespace key")
 	} else {
+		// This is a duplicate status suppression mechanism.
+		if lastObj, ok := pc.lastPodReceivedFromProvider.Load(key); ok {
+			lastPod := lastObj.(*corev1.Pod)
+			if cmp.Equal(lastPod.Status, pod.Status) {
+				log.G(ctx).Debug("Supressing duplicate pod status update")
+				return
+			}
+		}
+		_, err = pc.podsInformer.Lister().Pods(pod.Namespace).Get(pod.Name)
+		if errors.IsNotFound(err) {
+			log.G(ctx).Debug("Not enqueueing pod status update because pod deleted from api server")
+		}
+
+		log.G(ctx).WithField("key", key).Debug("Enqueueing pod status update")
+		pc.lastPodReceivedFromProvider.Store(key, pod.DeepCopy())
 		q.AddRateLimited(key)
 	}
 }
@@ -317,7 +322,7 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string, willR
 	defer span.End()
 
 	ctx = span.WithField(ctx, "key", key)
-	log.G(ctx).Debug("processing pod status update")
+	log.G(ctx).Debug("processing pod status update from provider")
 	defer func() {
 		span.SetStatus(retErr)
 		if retErr != nil {
@@ -327,17 +332,21 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string, willR
 
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
+		// Something has gone wrong, so we leak the pod status. We cannot safely delete the pod  status from our internal map,
+		// because it might be in a non-terminal state, and another (valid) update may be on the way
 		return pkgerrors.Wrap(err, "error splitting cache key")
 	}
 
 	pod, err := pc.podsLister.Pods(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
+			// We received a pod status update _after_ the pod was deleted in API server, so  we skip processing
+			pc.lastPodReceivedFromProvider.Delete(key)
 			log.G(ctx).WithError(err).Debug("Skipping pod status update for pod missing in Kubernetes")
 			return nil
 		}
 		return pkgerrors.Wrap(err, "error looking up pod")
 	}
 
-	return pc.updatePodStatus(ctx, pod)
+	return pc.updatePodStatus(ctx, pod, key)
 }

@@ -29,6 +29,7 @@ import (
 const (
 	// maxRetries is the number of times we try to process a given key before permanently forgetting it.
 	maxRetries = 20
+	defaultSleepTime = 5 * time.Second
 )
 
 type queueHandler func(ctx context.Context, key string, willRetry bool) error
@@ -122,7 +123,10 @@ func (pc *PodController) processPodStatusUpdate(ctx context.Context, workerID st
 // Providers should implement async update support, even if it just means copying
 // something like this in.
 func (pc *PodController) providerSyncLoop(ctx context.Context) {
-	const sleepTime = 5 * time.Second
+	sleepTime := pc.sleepTime
+	if sleepTime == 0 {
+		sleepTime = defaultSleepTime
+	}
 
 	t := time.NewTimer(sleepTime)
 	defer t.Stop()
@@ -147,7 +151,7 @@ func (pc *PodController) providerSyncLoop(ctx context.Context) {
 func (pc *PodController) runSyncFromProvider(ctx context.Context) {
 	if pn, ok := pc.provider.(PodNotifier); ok {
 		pn.NotifyPods(ctx, func(pod *corev1.Pod) {
-			enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
+			pc.enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod)
 		})
 	} else {
 		go pc.providerSyncLoop(ctx)
