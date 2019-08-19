@@ -210,6 +210,8 @@ func (pc *PodController) forceDeletePodResource(ctx context.Context, namespace, 
 }
 
 // updatePodStatuses syncs the providers pod status with the kubernetes pod status.
+// Deprecated: It is only called by the legacy reconciliation loop. Once NotifyPods becomes the only provider
+// interface, this will be removed
 func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.RateLimitingInterface) {
 	ctx, span := trace.StartSpan(ctx, "updatePodStatuses")
 	defer span.End()
@@ -225,8 +227,20 @@ func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.Rate
 	ctx = span.WithField(ctx, "nPods", int64(len(pods)))
 
 	for _, pod := range pods {
-		if !shouldSkipPodStatusUpdate(pod) {
-			enqueuePodStatusUpdate(ctx, q, pod)
+		l := log.G(ctx).WithField("name", pod.Name).WithField("namespace", pod.Namespace)
+		newPod := pod.DeepCopy()
+		status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
+		if errors.IsNotFound(err) || (err == nil && status == nil) {
+			l.Warn("Pod exists in API Server, but provider returned not found")
+			continue
+		} else if err != nil {
+			log.G(ctx).WithError(err).Warn("Could not retrieve pod status from provider")
+			continue
+		}
+
+		newPod.Status = *status
+		if !shouldSkipPodStatusUpdate(newPod) {
+			enqueuePodStatusUpdate(ctx, q, newPod)
 		}
 	}
 }
