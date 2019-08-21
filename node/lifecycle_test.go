@@ -23,11 +23,11 @@ import (
 	kubeinformers "k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	corev1client "k8s.io/client-go/kubernetes/typed/core/v1"
+	ktesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	watchutils "k8s.io/client-go/tools/watch"
 	"k8s.io/klog"
-	ktesting "k8s.io/client-go/testing"
 )
 
 var (
@@ -94,15 +94,11 @@ func TestPodLifecycle(t *testing.T) {
 
 	ctx = log.WithLogger(ctx, log.L)
 
-	// isPodDeletedPermanentlyFunc is a condition func that waits until the pod is _deleted_, which is the VK's
-	// action when the pod is deleted from the provider
-	isPodDeletedPermanentlyFunc := func(ctx context.Context, watcher watch.Interface) error {
+	isPodInTerminalStateFunc := func(ctx context.Context, watcher watch.Interface) error {
 		_, watchErr := watchutils.UntilWithoutRetry(ctx, watcher, func(ev watch.Event) (bool, error) {
 			log.G(ctx).WithField("event", ev).Info("got event")
-			// TODO(Sargun): The pod should have transitioned into some status around failed / succeeded
-			// prior to being deleted.
-			// In addition, we should check if the deletion timestamp gets set
-			return ev.Type == watch.Deleted, nil
+			pod := ev.Object.(*corev1.Pod)
+			return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed, nil
 		})
 		return watchErr
 	}
@@ -113,7 +109,7 @@ func TestPodLifecycle(t *testing.T) {
 
 		t.Run("mockProvider", func(t *testing.T) {
 			assert.NilError(t, wireUpSystem(ctx, newMockProvider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalStateFunc)
 			}))
 		})
 
@@ -122,7 +118,7 @@ func TestPodLifecycle(t *testing.T) {
 		}
 		t.Run("mockV0Provider", func(t *testing.T) {
 			assert.NilError(t, wireUpSystem(ctx, newMockV0Provider(), func(ctx context.Context, s *system) {
-				testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+				testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalStateFunc)
 			}))
 		})
 	})
@@ -133,7 +129,7 @@ func TestPodLifecycle(t *testing.T) {
 		mp := newMockProvider()
 		mp.errorOnDelete = errdefs.NotFound("not found")
 		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
-			testCreateStartDeleteScenario(ctx, t, s, isPodDeletedPermanentlyFunc)
+			testCreateStartDeleteScenario(ctx, t, s, isPodInTerminalStateFunc)
 		}))
 	})
 

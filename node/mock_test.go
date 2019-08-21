@@ -215,8 +215,10 @@ func (p *mockV0Provider) DeletePod(ctx context.Context, pod *v1.Pod) (err error)
 	p.notifier(pod)
 	p.pods.Store(key, pod)
 	if pod.DeletionGracePeriodSeconds == nil || *pod.DeletionGracePeriodSeconds == 0 {
+		log.G(ctx).Debug("Deleted pod status immediately")
 		p.pods.Delete(key)
 	} else {
+		log.G(ctx).Debugf("Deleting pod status after %d seconds", *pod.DeletionGracePeriodSeconds)
 		time.AfterFunc(time.Duration(*pod.DeletionGracePeriodSeconds)*time.Second, func() {
 			p.pods.Delete(key)
 		})

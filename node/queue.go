@@ -121,7 +121,7 @@ func (pc *PodController) processPodStatusUpdate(ctx context.Context, workerID st
 // Providers should implement async update support, even if it just means copying
 // something like this in.
 func (pc *PodController) providerSyncLoop(ctx context.Context, q workqueue.RateLimitingInterface) {
-	const sleepTime = 5 * time.Second
+	const sleepTime = 1 * time.Second
 
 	t := time.NewTimer(sleepTime)
 	defer t.Stop()
@@ -146,7 +146,8 @@ func (pc *PodController) providerSyncLoop(ctx context.Context, q workqueue.RateL
 func (pc *PodController) runSyncFromProvider(ctx context.Context, q workqueue.RateLimitingInterface) {
 	if pn, ok := pc.provider.(PodNotifier); ok {
 		pn.NotifyPods(ctx, func(pod *corev1.Pod) {
-			enqueuePodStatusUpdate(ctx, q, pod)
+			pod = pod.DeepCopy()
+			pc.enqueuePodStatusUpdate(ctx, q, pod, &pod.Status)
 		})
 	} else {
 		go pc.providerSyncLoop(ctx, q)

@@ -33,6 +33,10 @@ import (
 	"k8s.io/client-go/util/workqueue"
 )
 
+var (
+	errPodStatusMissing = pkgerrors.New("Pod status not found")
+)
+
 const (
 	podStatusReasonProviderFailed = "ProviderFailed"
 )
@@ -151,40 +155,21 @@ func (pc *PodController) handleProviderError(ctx context.Context, span trace.Spa
 	span.SetStatus(origErr)
 }
 
-func (pc *PodController) deletePod(ctx context.Context, namespace, name string) error {
+func (pc *PodController) deletePod(ctx context.Context, pod *corev1.Pod) error {
 	ctx, span := trace.StartSpan(ctx, "deletePod")
 	defer span.End()
-
-	pod, err := pc.provider.GetPod(ctx, namespace, name)
-	if err != nil {
-		if errdefs.IsNotFound(err) {
-			// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-			return pc.forceDeletePodResource(ctx, namespace, name)
-		}
-		return err
-	}
-
-	// NOTE: Some providers return a non-nil error in their GetPod implementation when the pod is not found while some other don't.
-	if pod == nil {
-		// The provider is not aware of the pod, but we must still delete the Kubernetes API resource.
-		return pc.forceDeletePodResource(ctx, namespace, name)
-	}
 
 	ctx = addPodAttributes(ctx, span, pod)
 
 	var delErr error
-	if delErr = pc.provider.DeletePod(ctx, pod.DeepCopy()); delErr != nil && !errdefs.IsNotFound(delErr) {
+	if delErr = pc.provider.DeletePod(ctx, pod.DeepCopy()); errdefs.IsNotFound(delErr) {
+		pc.enqueuePodStatusUpdate(ctx, pc.podStatusQueue, pod, nil)
+	} else if delErr != nil {
 		span.SetStatus(delErr)
 		return delErr
 	}
 
 	log.G(ctx).Debug("Deleted pod from provider")
-
-	if err := pc.forceDeletePodResource(ctx, namespace, name); err != nil {
-		span.SetStatus(err)
-		return err
-	}
-	log.G(ctx).Info("Deleted pod from Kubernetes")
 
 	return nil
 }
@@ -228,50 +213,36 @@ func (pc *PodController) updatePodStatuses(ctx context.Context, q workqueue.Rate
 
 	for _, pod := range pods {
 		l := log.G(ctx).WithField("name", pod.Name).WithField("namespace", pod.Namespace)
-		newPod := pod.DeepCopy()
 		status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
-		if errors.IsNotFound(err) || (err == nil && status == nil) {
-			l.Warn("Pod exists in API Server, but provider returned not found")
-			continue
-		} else if err != nil {
-			log.G(ctx).WithError(err).Warn("Could not retrieve pod status from provider")
+		if err != nil && !errors.IsNotFound(err) {
+			l.WithError(err).Warn("Could not retrieve pod status from provider")
 			continue
 		}
-
-		newPod.Status = *status
-		if !shouldSkipPodStatusUpdate(newPod) {
-			enqueuePodStatusUpdate(ctx, q, newPod)
-		}
+		pc.enqueuePodStatusUpdate(ctx, q, pod, status)
 	}
 }
 
-func shouldSkipPodStatusUpdate(pod *corev1.Pod) bool {
-	return pod.Status.Phase == corev1.PodSucceeded ||
-		pod.Status.Phase == corev1.PodFailed ||
-		pod.Status.Reason == podStatusReasonProviderFailed
-}
-
-func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) error {
-	if shouldSkipPodStatusUpdate(pod) {
-		return nil
-	}
-
+func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod, key string) error {
 	ctx, span := trace.StartSpan(ctx, "updatePodStatus")
 	defer span.End()
 	ctx = addPodAttributes(ctx, span, pod)
 
-	status, err := pc.provider.GetPodStatus(ctx, pod.Namespace, pod.Name)
-	if err != nil && !errdefs.IsNotFound(err) {
-		span.SetStatus(err)
-		return pkgerrors.Wrap(err, "error retrieving pod status")
+	status, ok := pc.lastPodStatusReceivedFromProvider.Load(key)
+
+	if !ok {
+		log.G(ctx).WithField("key", key).Warn("Pod Status not found")
+		span.SetStatus(errPodStatusMissing)
+		return errPodStatusMissing
 	}
+
+	podStatus := status.(*corev1.PodStatus)
 
 	// Do not modify the pod that we got from the cache
 	pod = pod.DeepCopy()
 
 	// Update the pod's status
-	if status != nil {
-		pod.Status = *status
+	if podStatus != nil {
+		pod.Status = *(podStatus)
 	} else {
 		// Only change the status when the pod was already up
 		// Only doing so when the pod was successfully running makes sure we don't run into race conditions during pod creation.
@@ -294,7 +265,9 @@ func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) e
 		}
 	}
 
-	if _, err := pc.client.Pods(pod.Namespace).UpdateStatus(pod); err != nil {
+	if _, err := pc.client.Pods(pod.Namespace).UpdateStatus(pod); errors.IsNotFound(err) {
+		pc.lastPodStatusReceivedFromProvider.Delete(key)
+	} else if err != nil {
 		span.SetStatus(err)
 		return pkgerrors.Wrap(err, "error while updating pod status in kubernetes")
 	}
@@ -307,12 +280,24 @@ func (pc *PodController) updatePodStatus(ctx context.Context, pod *corev1.Pod) e
 	return nil
 }
 
-func enqueuePodStatusUpdate(ctx context.Context, q workqueue.RateLimitingInterface, pod *corev1.Pod) {
-	if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
+func (pc *PodController) enqueuePodStatusUpdate(ctx context.Context, q workqueue.RateLimitingInterface, pod *corev1.Pod, status *corev1.PodStatus) {
+	key, err := cache.MetaNamespaceKeyFunc(pod)
+	if err != nil {
 		log.G(ctx).WithError(err).WithField("method", "enqueuePodStatusUpdate").Error("Error getting pod meta namespace key")
-	} else {
-		q.AddRateLimited(key)
+		return
 	}
+
+	// Check if the pod has been deleted from the pod informer, if so, we don't bother
+	_, err = pc.podsInformer.Lister().Pods(pod.Namespace).Get(pod.Name)
+	if errors.IsNotFound(err) {
+		log.G(ctx).WithField("key", key).Debug("Short circuiting enqueuePodStatusUpdate because pod not in informer")
+		return
+	}
+
+	// We don't really care about other classes of errors
+	pc.lastPodStatusReceivedFromProvider.Store(key, status)
+	q.AddRateLimited(key)
+
 }
 
 func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retErr error) {
@@ -335,12 +320,14 @@ func (pc *PodController) podStatusHandler(ctx context.Context, key string) (retE
 
 	pod, err := pc.podsLister.Pods(namespace).Get(name)
 	if err != nil {
+		// This should only happen if the pod has been deleted in the api server. At this point, updates are pointless
 		if errors.IsNotFound(err) {
 			log.G(ctx).WithError(err).Debug("Skipping pod status update for pod missing in Kubernetes")
+			pc.lastPodStatusReceivedFromProvider.Delete(key)
 			return nil
 		}
 		return pkgerrors.Wrap(err, "error looking up pod")
 	}
 
-	return pc.updatePodStatus(ctx, pod)
+	return pc.updatePodStatus(ctx, pod, key)
 }
