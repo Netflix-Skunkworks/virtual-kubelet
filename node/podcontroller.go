@@ -88,9 +88,18 @@ type PodNotifier interface {
 	NotifyPods(context.Context, func(*corev1.Pod))
 }
 
+// PodLifecycleHandlerV1 combines the PodNotifier interface, along with the old, PodLifecycleHandler interface. If you
+// have a legacy PodLifecycleHandler, you can use WrapLegacyPodLifecycleHandler to wrap your provider, and pass
+// a PodLifecycleHandlerV1
+type PodLifecycleHandlerV1 interface {
+	PodLifecycleHandler
+	PodNotifier
+}
+
 // PodController is the controller implementation for Pod resources.
 type PodController struct {
-	provider PodLifecycleHandler
+	provider       PodLifecycleHandlerV1
+	legacyProvider PodLifecycleHandler
 
 	// podsInformer is an informer for Pod resources.
 	podsInformer corev1informers.PodInformer
@@ -166,11 +175,15 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 		client:          cfg.PodClient,
 		podsInformer:    cfg.PodInformer,
 		podsLister:      cfg.PodInformer.Lister(),
-		provider:        cfg.Provider,
 		resourceManager: rm,
 		ready:           make(chan struct{}),
 		recorder:        cfg.EventRecorder,
 		k8sQ:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodsFromKubernetes"),
+	}
+	if pn, ok := cfg.Provider.(PodLifecycleHandlerV1); ok {
+		pc.provider = pn
+	} else {
+		pc.legacyProvider = cfg.Provider
 	}
 
 	// Set up event handlers for when Pod resources change.
@@ -216,6 +229,13 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 // Run will set up the event handlers for types we are interested in, as well as syncing informer caches and starting workers.
 // It will block until the context is cancelled, at which point it will shutdown the work queue and wait for workers to finish processing their current work items.
 func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) error {
+	if pc.provider == nil {
+		var err error
+		pc.provider, err = WrapLegacyPodLifecycleHandler(ctx, pc.legacyProvider, 5*time.Second)
+		if err != nil {
+			return err
+		}
+	}
 	defer pc.k8sQ.ShutDown()
 
 	podStatusQueue := workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "syncPodStatusFromProvider")
