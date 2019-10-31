@@ -206,6 +206,16 @@ func TestPodLifecycle(t *testing.T) {
 			}))
 		})
 	})
+
+	// podReachesTerminalStatusNaturally tests the flow if the pod naturally succeeds, if it's deleted
+	// from the API server
+	t.Run("podReachesTerminalStatusNaturally", func(t *testing.T) {
+		mp := newMockProvider()
+		mp.errorOnDelete = errdefs.NotFound("not found")
+		assert.NilError(t, wireUpSystem(ctx, mp, func(ctx context.Context, s *system) {
+			testPodReachesTerminalStatusNaturally(ctx, t, s, isPodDeletedPermanentlyFunc, false)
+		}))
+	})
 }
 
 type testFunction func(ctx context.Context, s *system)
