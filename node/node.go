@@ -440,7 +440,7 @@ func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, nodeName stri
 		return nil, err
 	}
 	log.G(ctx).WithField("node.Status.Conditions", oldNode.Status.Conditions).
-		Info("got node from api server")
+		Debug("got node from api server")
 
 	node := oldNode.DeepCopy()
 	nodeProvider.SetNodeStatus(ctx, node)
@@ -455,7 +455,7 @@ func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, nodeName stri
 
 	log.G(ctx).WithField("node.resourceVersion", updated.ResourceVersion).
 		WithField("node.Status.Conditions", updated.Status.Conditions).
-		Info("updated node status in api server")
+		Debug("updated node status in api server")
 	return updated, nil
 }
 
