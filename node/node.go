@@ -28,6 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/typed/coordination/v1beta1"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
 )
@@ -50,7 +51,16 @@ type NodeProvider interface { //nolint:golint
 	// the status.
 	//
 	// NotifyNodeStatus should not block callers.
+	//
+	// Deprecated: Asynchronous NodeStatus updates do not align with the Kubelet
+	// approach and interfere with other components which may wish to modify
+	// NodeStatus
 	NotifyNodeStatus(ctx context.Context, cb func(*corev1.Node))
+
+	// SetNodeStatus allows the NodeProvider to make whatever changes to
+	// NodeStatus for those elements on which it is authoritative.  All other
+	// elements should be left unmodified.
+	SetNodeStatus(ctx context.Context, node *corev1.Node)
 }
 
 // NewNodeController creates a new node controller.
@@ -151,7 +161,6 @@ type NodeController struct { // nolint: golint
 	pingInterval   time.Duration
 	statusInterval time.Duration
 	lease          *coord.Lease
-	chStatusUpdate chan *corev1.Node
 
 	nodeStatusUpdateErrorHandler ErrorHandler
 
@@ -183,11 +192,6 @@ func (n *NodeController) Run(ctx context.Context) error {
 	if n.statusInterval == time.Duration(0) {
 		n.statusInterval = DefaultStatusUpdateInterval
 	}
-
-	n.chStatusUpdate = make(chan *corev1.Node)
-	n.p.NotifyNodeStatus(ctx, func(node *corev1.Node) {
-		n.chStatusUpdate <- node
-	})
 
 	if err := n.ensureNode(ctx); err != nil {
 		return err
@@ -243,12 +247,8 @@ func (n *NodeController) controlLoop(ctx context.Context) error {
 
 	statusTimer := time.NewTimer(n.statusInterval)
 	defer statusTimer.Stop()
-	timerResetDuration := n.statusInterval
-	if n.disableLease {
-		// when resetting the timer after processing a status update, reset it to the ping interval
-		// (since it will be the ping timer as n.disableLease == true)
-		timerResetDuration = n.pingInterval
 
+	if n.disableLease {
 		// hack to make sure this channel always blocks since we won't be using it
 		if !statusTimer.Stop() {
 			<-statusTimer.C
@@ -261,26 +261,6 @@ func (n *NodeController) controlLoop(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return nil
-		case updated := <-n.chStatusUpdate:
-			var t *time.Timer
-			if n.disableLease {
-				t = pingTimer
-			} else {
-				t = statusTimer
-			}
-
-			log.G(ctx).Debug("Received node status update")
-			// Performing a status update so stop/reset the status update timer in this
-			// branch otherwise there could be an unnecessary status update.
-			if !t.Stop() {
-				<-t.C
-			}
-
-			n.n.Status = updated.Status
-			if err := n.updateStatus(ctx, false); err != nil {
-				log.G(ctx).WithError(err).Error("Error handling node status update")
-			}
-			t.Reset(timerResetDuration)
 		case <-statusTimer.C:
 			if err := n.updateStatus(ctx, false); err != nil {
 				log.G(ctx).WithError(err).Error("Error handling node status update")
@@ -326,9 +306,8 @@ func (n *NodeController) updateLease(ctx context.Context) error {
 }
 
 func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) error {
-	updateNodeStatusHeartbeat(n.n)
 
-	node, err := updateNodeStatus(ctx, n.nodes, n.n)
+	node, err := updateNodeStatus(ctx, n.nodes, n.n.Name, n.p)
 	if err != nil {
 		if skipErrorCb || n.nodeStatusUpdateErrorHandler == nil {
 			return err
@@ -337,7 +316,7 @@ func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) err
 			return err
 		}
 
-		node, err = updateNodeStatus(ctx, n.nodes, n.n)
+		node, err = updateNodeStatus(ctx, n.nodes, n.n.Name, n.p)
 		if err != nil {
 			return err
 		}
@@ -406,12 +385,12 @@ func updateNodeLease(ctx context.Context, leases v1beta1.LeaseInterface, lease *
 var emptyGetOptions = metav1.GetOptions{}
 
 // patchNodeStatus patches node status.
-func patchNodeStatus(nodes v1.NodeInterface, nodeName types.NodeName, newStatus corev1.NodeStatus) (*corev1.Node, []byte, error) {
-	raw, err := json.Marshal(&newStatus)
+// Copied from github.com/kubernetes/kubernetes/pkg/util/node
+func patchNodeStatus(nodes v1.NodeInterface, nodeName types.NodeName, oldNode *corev1.Node, newNode *corev1.Node) (*corev1.Node, []byte, error) {
+	patchBytes, err := preparePatchBytesforNodeStatus(nodeName, oldNode, newNode)
 	if err != nil {
 		return nil, nil, err
 	}
-	patchBytes := []byte(fmt.Sprintf(`{"status":%s}`, raw))
 
 	updatedNode, err := nodes.Patch(string(nodeName), types.StrategicMergePatchType, patchBytes, "status")
 	if err != nil {
@@ -420,28 +399,56 @@ func patchNodeStatus(nodes v1.NodeInterface, nodeName types.NodeName, newStatus 
 	return updatedNode, patchBytes, nil
 }
 
+func preparePatchBytesforNodeStatus(nodeName types.NodeName, oldNode *corev1.Node, newNode *corev1.Node) ([]byte, error) {
+	oldData, err := json.Marshal(oldNode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to Marshal oldData for node %q: %v", nodeName, err)
+	}
+
+	// Reset spec to make sure only patch for Status or ObjectMeta is generated.
+	// Note that we don't reset ObjectMeta here, because:
+	// 1. This aligns with Nodes().UpdateStatus().
+	// 2. Some component does use this to update node annotations.
+	newNode.Spec = oldNode.Spec
+	newData, err := json.Marshal(newNode)
+	if err != nil {
+		return nil, fmt.Errorf("failed to Marshal newData for node %q: %v", nodeName, err)
+	}
+
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, corev1.Node{})
+	if err != nil {
+		return nil, fmt.Errorf("failed to CreateTwoWayMergePatch for node %q: %v", nodeName, err)
+	}
+	return patchBytes, nil
+}
+
 // updateNodeStatus triggers an update to the node status in Kubernetes.
 // It first fetches the current node details and then sets the status according
 // to the passed in node object.
 //
 // If you use this function, it is up to you to synchronize this with other operations.
 // This reduces the time to second-level precision.
-func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, n *corev1.Node) (_ *corev1.Node, retErr error) {
+func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, nodeName string, nodeProvider NodeProvider) (_ *corev1.Node, retErr error) {
 	ctx, span := trace.StartSpan(ctx, "UpdateNodeStatus")
 	defer func() {
 		span.End()
 		span.SetStatus(retErr)
 	}()
 
-	_, err := nodes.Get(n.Name, emptyGetOptions)
+	oldNode, err := nodes.Get(nodeName, emptyGetOptions)
 	if err != nil {
 		return nil, err
 	}
+	log.G(ctx).WithField("node.Status.Conditions", oldNode.Status.Conditions).
+		Info("got node from api server")
 
-	ctx = addNodeAttributes(ctx, span, n)
+	node := oldNode.DeepCopy()
+	nodeProvider.SetNodeStatus(ctx, node)
+	ctx = addNodeAttributes(ctx, span, node)
+	updateNodeStatusHeartbeat(node)
 
 	// Patch the node status to merge other changes on the node.
-	updated, _, err := patchNodeStatus(nodes, types.NodeName(n.Name), n.Status)
+	updated, _, err := patchNodeStatus(nodes, types.NodeName(node.Name), oldNode, node)
 	if err != nil {
 		return nil, err
 	}
@@ -500,6 +507,13 @@ func (NaiveNodeProvider) Ping(ctx context.Context) error {
 // This NaiveNodeProvider does not support updating node status and so this
 // function is a no-op.
 func (NaiveNodeProvider) NotifyNodeStatus(ctx context.Context, f func(*corev1.Node)) {
+}
+
+// SetNodeStatus implements the NodeProvider interface.
+//
+// This NaiveNodeProvider does not support updating node status and so this
+// function is a no-op.
+func (NaiveNodeProvider) SetNodeStatus(ctx context.Context, node *corev1.Node) {
 }
 
 type taintsStringer []corev1.Taint

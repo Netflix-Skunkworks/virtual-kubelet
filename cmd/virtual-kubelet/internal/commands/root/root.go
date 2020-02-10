@@ -149,7 +149,7 @@ func runRootCommand(ctx context.Context, s *provider.Store, c Opts) error {
 
 	pNode := NodeFromProvider(ctx, c.NodeName, taint, p, c.Version)
 	nodeRunner, err := node.NewNodeController(
-		node.NaiveNodeProvider{},
+		p,
 		pNode,
 		client.CoreV1().Nodes(),
 		node.WithNodeEnableLeaseV1Beta1(leaseClient, nil),
