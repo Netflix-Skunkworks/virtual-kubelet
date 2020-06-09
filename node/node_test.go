@@ -16,7 +16,23 @@ package node
 
 import (
 	"context"
+
+	"github.com/sirupsen/logrus"
+	"github.com/virtual-kubelet/virtual-kubelet/log"
+	loglogrus "github.com/virtual-kubelet/virtual-kubelet/log/logrus"
+
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
+	"k8s.io/klog"
+
+	//"k8s.io/client-go/kubernetes"
+	//"k8s.io/client-go/util/retry"
 	"strings"
+
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	//"sync"
 	"testing"
 	"time"
 
@@ -28,11 +44,166 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	watch "k8s.io/apimachinery/pkg/watch"
 	testclient "k8s.io/client-go/kubernetes/fake"
+	"k8s.io/client-go/kubernetes/scheme"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
 )
 
 func TestNodeRun(t *testing.T) {
 	t.Run("WithoutLease", func(t *testing.T) { testNodeRun(t, false) })
 	t.Run("WithLease", func(t *testing.T) { testNodeRun(t, true) })
+}
+
+func TestNodeConditionsPatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	lgr := logrus.New()
+	lgr.SetLevel(logrus.DebugLevel)
+	log.WithLogger(ctx, loglogrus.FromLogrus(lgr.WithFields(nil)))
+
+	testEnv := &envtest.Environment{
+		CRDDirectoryPaths: []string{},
+		KubeAPIServerFlags: []string{
+			//		"-v=100",
+			"--advertise-address=127.0.0.1",
+			"--etcd-servers={{ if .EtcdURL }}{{ .EtcdURL.String }}{{ end }}",
+			"--cert-dir={{ .CertDir }}",
+			"--insecure-port={{ if .URL }}{{ .URL.Port }}{{ end }}",
+			"--insecure-bind-address={{ if .URL }}{{ .URL.Hostname }}{{ end }}",
+			"--secure-port={{ if .SecurePort }}{{ .SecurePort }}{{ end }}",
+			// we're keeping this disabled because if enabled, default SA is missing which would force all tests to create one
+			// in normal apiserver operation this SA is created by controller, but that is not run in integration environment
+			"--disable-admission-plugins=ServiceAccount",
+			"--service-cluster-ip-range=10.0.0.0/24",
+			"--allow-privileged=true",
+			"--audit-log-path=audit.log",
+			"--audit-policy-file=../audit.yaml",
+		},
+	}
+
+	cfg, err := testEnv.Start()
+	assert.NilError(t, err)
+	defer testEnv.Stop()
+	defer time.Sleep(time.Second * 10)
+
+	assert.NilError(t, clientgoscheme.AddToScheme(scheme.Scheme))
+
+	var k8sClient client.Client
+	k8sClient, err = client.New(cfg, client.Options{Scheme: scheme.Scheme})
+
+	err = k8sClient.List(ctx, &corev1.PodList{})
+	assert.NilError(t, err)
+
+	_ = ctx
+	clientset, err := kubernetes.NewForConfig(cfg)
+	assert.NilError(t, err)
+	nodes := clientset.CoreV1().Nodes()
+
+	baseCondition := corev1.NodeCondition{
+		Type:    "BaseCondition",
+		Status:  "True",
+		Reason:  "NA",
+		Message: "This is a condition that should always be there",
+	}
+
+	testProvider := &testNodeProvider{
+		NodeProvider: &NaiveNodeProvider{},
+	}
+
+	testNode := testNode(t)
+	// We have to refer to testNodeCopy during the course of the test. testNode is modified by the node controller
+	// so it will trigger the race detector.
+	testNodeCopy := testNode.DeepCopy()
+	node, err := NewNodeController(testProvider, testNode, clientset.CoreV1().Nodes(), WithNodePingInterval(time.Second), WithNodeStatusUpdateInterval(2*time.Second))
+	assert.NilError(t, err)
+
+	chErr := make(chan error)
+	defer func() {
+		cancel()
+		assert.NilError(t, <-chErr)
+	}()
+
+	go func() {
+		chErr <- node.Run(ctx)
+		close(chErr)
+	}()
+
+	//nw := makeWatch(t, nodes, testNodeCopy.Name)
+	nw, err := nodes.Watch(metav1.ListOptions{FieldSelector: fields.OneTermEqualSelector("metadata.name", testNodeCopy.Name).String()})
+	assert.NilError(t, err)
+	defer nw.Stop()
+	nr := nw.ResultChan()
+
+	// Wait for the node to exist
+	klog.Infoln("Waiting for node")
+	for e := range nr {
+		klog.Infof("Got initial node: %v", e)
+		break
+	}
+
+	testProvider.callbackStatus(&corev1.Node{
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				baseCondition,
+			},
+		},
+	})
+
+	for e := range nr {
+		klog.Infof("Got node: %v", e)
+		if len(e.Object.(*corev1.Node).Status.Conditions) > 0 {
+			klog.Infof("Saw condition, falling through")
+			break
+		}
+	}
+
+	manuallyAddedCondition := corev1.NodeCondition{
+		Type:              "manuallyAddedCondition",
+		Status:            "True",
+		Reason:            "manuallyAddedConditionAdded",
+		Message:           "we added a condition manually",
+		LastHeartbeatTime: metav1.Now(),
+	}
+	assert.NilError(t, retry.RetryOnConflict(retry.DefaultBackoff, func() error {
+		node, err := nodes.Get(testNodeCopy.Name, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
+
+		node.Status.Conditions = append(node.Status.Conditions, manuallyAddedCondition)
+
+		node, err = nodes.UpdateStatus(node)
+		klog.Infof("Updated node: %v", node)
+		return err
+	}))
+
+	newCondition := corev1.NodeCondition{
+		Type:    "NewCondition",
+		Status:  "True",
+		Reason:  "NA",
+		Message: "This is a new condition brought on by VK.",
+	}
+
+	testProvider.callbackStatus(&corev1.Node{
+		Status: corev1.NodeStatus{
+			Conditions: []corev1.NodeCondition{
+				baseCondition,
+				newCondition,
+			},
+		},
+	})
+
+	// We've added the manual condition, now to ask the status update to add our test condition
+	// we can then see if both the test condition and the manually added condition show up in a status update
+
+	for result := range nr {
+		node := result.Object.(*corev1.Node)
+		klog.Infof("Node: %v", node)
+		if len(node.Status.Conditions) == 3 {
+			break
+		}
+	}
 }
 
 func testNodeRun(t *testing.T, enableLease bool) {
@@ -205,10 +376,10 @@ func TestNodeCustomUpdateStatusErrorHandler(t *testing.T) {
 	case <-node.Ready():
 	}
 
-	err = nodes.Delete(node.n.Name, nil)
+	err = nodes.Delete(node.latestNodeReceivedFromProvider.Name, nil)
 	assert.NilError(t, err)
 
-	testP.triggerStatusUpdate(node.n.DeepCopy())
+	testP.triggerStatusUpdate(node.latestNodeReceivedFromProvider.DeepCopy())
 
 	timer = time.NewTimer(10 * time.Second)
 	defer timer.Stop()
@@ -248,20 +419,20 @@ func TestUpdateNodeStatus(t *testing.T) {
 	nodes := testclient.NewSimpleClientset().CoreV1().Nodes()
 
 	ctx := context.Background()
-	updated, err := updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err := updateNodeStatus(ctx, nodes, nil, n.DeepCopy())
 	assert.Equal(t, errors.IsNotFound(err), true, err)
 
 	_, err = nodes.Create(n)
 	assert.NilError(t, err)
 
-	updated, err = updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err = updateNodeStatus(ctx, nodes, nil, n.DeepCopy())
 	assert.NilError(t, err)
 
 	assert.NilError(t, err)
 	assert.Check(t, cmp.DeepEqual(n.Status, updated.Status))
 
 	n.Status.Phase = corev1.NodeRunning
-	updated, err = updateNodeStatus(ctx, nodes, n.DeepCopy())
+	updated, err = updateNodeStatus(ctx, nodes, nil, n.DeepCopy())
 	assert.NilError(t, err)
 	assert.Check(t, cmp.DeepEqual(n.Status, updated.Status))
 
@@ -271,7 +442,7 @@ func TestUpdateNodeStatus(t *testing.T) {
 	_, err = nodes.Get(n.Name, metav1.GetOptions{})
 	assert.Equal(t, errors.IsNotFound(err), true, err)
 
-	_, err = updateNodeStatus(ctx, nodes, updated.DeepCopy())
+	_, err = updateNodeStatus(ctx, nodes, nil, updated.DeepCopy())
 	assert.Equal(t, errors.IsNotFound(err), true, err)
 }
 
@@ -383,15 +554,20 @@ func testNode(t *testing.T) *corev1.Node {
 type testNodeProvider struct {
 	NodeProvider
 	statusHandlers []func(*corev1.Node)
+	// callback status is to let VK know the node, with the updated status
+	callbackStatus func(node *corev1.Node)
 }
 
 func (p *testNodeProvider) NotifyNodeStatus(ctx context.Context, h func(*corev1.Node)) {
-	p.statusHandlers = append(p.statusHandlers, h)
+	p.callbackStatus = h
 }
 
 func (p *testNodeProvider) triggerStatusUpdate(n *corev1.Node) {
 	for _, h := range p.statusHandlers {
 		h(n)
+	}
+	if p.callbackStatus != nil {
+		p.callbackStatus(n)
 	}
 }
 

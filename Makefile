@@ -20,9 +20,15 @@ gox := github.com/mitchellh/gox@v1.0.1
 
 # comment this line out for quieter things
 # V := 1 # When V is set, print commands and build progress.
+Q := $(if $V,,@)
 
 # Space separated patterns of packages to skip in list, test, format.
 IGNORED_PACKAGES := /vendor/
+
+TEST_FLAGS ?= -timeout=10m
+
+kubebuilder_version := 2.3.1
+export KUBEBUILDER_ASSETS := $(PWD)/kubebuilder$(kubebuilder_version)/bin
 
 .PHONY: all
 all: test build
@@ -76,10 +82,15 @@ else
        tee test/vet.txt | sed '$$ d'; exit $$(tail -1 test/vet.txt)
 endif
 
-test:
+$(KUBEBUILDER_ASSETS)/etcd $(KUBEBUILDER_ASSETS)/kube-apiserver:
+	mkdir -p kubebuilder$(kubebuilder_version)
+	curl -L -o - https://github.com/kubernetes-sigs/kubebuilder/releases/download/v$(kubebuilder_version)/kubebuilder_$(kubebuilder_version)_$(shell go env GOOS)_amd64.tar.gz | tar -xzv --strip-components 1 -C kubebuilder$(kubebuilder_version) -f -
+
+
+test: $(KUBEBUILDER_ASSETS)/etcd $(KUBEBUILDER_ASSETS)/kube-apiserver
 ifndef CI
-	@echo "Testing..."
-	$Q go test  $(if $V,-v) $(allpackages)
+	@echo "Testing locally..."
+	$Q go test  $(if $V,-v) $(TEST_FLAGS) $(allpackages)
 else
 	@echo "Testing in CI..."
 	$Q mkdir -p test
@@ -165,8 +176,6 @@ goreleaser: $(gobin_tool)
 gox: $(gobin_tool)
 	# We make gox globally available, for people to use by hand
 	$(gobin_tool) $(gox)
-
-Q := $(if $V,,@)
 
 $(gobin_tool):
 	GO111MODULE=off go get -u github.com/myitcv/gobin
