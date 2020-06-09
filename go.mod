@@ -8,25 +8,25 @@ require (
 	github.com/docker/spdystream v0.0.0-20170912183627-bc6354cbbc29 // indirect
 	github.com/elazarl/goproxy v0.0.0-20190421051319-9d40249d3c2f // indirect
 	github.com/elazarl/goproxy/ext v0.0.0-20190711103511-473e67f1d7d2 // indirect
-	github.com/golang/groupcache v0.0.0-20181024230925-c65c006176ff // indirect
 	github.com/google/go-cmp v0.3.1
-	github.com/googleapis/gnostic v0.1.0 // indirect
 	github.com/gorilla/mux v1.7.0
 	github.com/konsorten/go-windows-terminal-sequences v1.0.2 // indirect
 	github.com/mitchellh/go-homedir v1.1.0
 	github.com/pkg/errors v0.8.1
 	github.com/prometheus/client_golang v1.0.0
+	github.com/prometheus/client_model v0.2.0 // indirect
 	github.com/sirupsen/logrus v1.4.2
 	github.com/spf13/cobra v0.0.5
 	github.com/spf13/pflag v1.0.5
 	go.opencensus.io v0.21.0
-	golang.org/x/sys v0.0.0-20190826190057-c7b8b68b1456
+	golang.org/x/sys v0.0.0-20190922100055-0a153f010e69
 	gotest.tools v2.2.0+incompatible
-	k8s.io/api v0.0.0
-	k8s.io/apimachinery v0.0.0
-	k8s.io/client-go v0.0.0
+	k8s.io/api v0.17.6
+	k8s.io/apimachinery v0.17.6
+	k8s.io/client-go v0.17.6
 	k8s.io/klog v1.0.0
 	k8s.io/kubernetes v1.17.6
+	sigs.k8s.io/controller-runtime v0.5.5
 )
 
 replace k8s.io/legacy-cloud-providers => github.com/kubernetes/kubernetes/staging/src/k8s.io/legacy-cloud-providers v0.0.0-20200520130745-d32e40e20d16
