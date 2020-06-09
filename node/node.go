@@ -17,7 +17,6 @@ package node
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"time"
 
 	pkgerrors "github.com/pkg/errors"
@@ -31,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/strategicpatch"
 	"k8s.io/client-go/kubernetes/typed/coordination/v1beta1"
 	v1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/client-go/util/retry"
 )
 
 // NodeProvider is the interface used for registering a node and updating its
@@ -63,7 +63,7 @@ type NodeProvider interface { //nolint:golint
 // Note: When if there are multiple NodeControllerOpts which apply against the same
 // underlying options, the last NodeControllerOpt will win.
 func NewNodeController(p NodeProvider, node *corev1.Node, nodes v1.NodeInterface, opts ...NodeControllerOpt) (*NodeController, error) {
-	n := &NodeController{p: p, n: node, nodes: nodes, chReady: make(chan struct{})}
+	n := &NodeController{p: p, latestNodeReceivedFromProvider: node, nodes: nodes, chReady: make(chan struct{})}
 	for _, o := range opts {
 		if err := o(n); err != nil {
 			return nil, pkgerrors.Wrap(err, "error applying node option")
@@ -143,7 +143,44 @@ type ErrorHandler func(context.Context, error) error
 // NodeController manages a single node entity.
 type NodeController struct { // nolint: golint
 	p NodeProvider
-	n *corev1.Node
+
+	// We use these two values to calculate a patch. We use a three-way patch in order to avoid
+	// causing state regression server side. For example, let's consider the scenario:
+	/*
+
+		+-----+                                           +-----+                              +-----+
+		| VK  |                                           | K8s |                              | Ext |
+		+-----+                                           +-----+                              +-----+
+		   | ---------------------------------------------\  |                                    |
+		   |-| Updates internal node conditions to [A, B] |  |                                    |
+		   | |--------------------------------------------|  |                                    |
+		   |                                                 |                                    |
+		   | Patch upsert: [A, B]                            |                                    |
+		   |------------------------------------------------>|                                    |
+		   |                  -----------------------------\ |                                    |
+		   |                  | Node conditions are [A, B] |-|                                    |
+		   |                  |----------------------------| |                                    |
+		   |                                                 |                                    |
+		   |                                                 |                    Patch upsert: C |
+		   |                                                 |<-----------------------------------|
+		   |                                                 | --------------------------------\  |
+		   |                                                 |-| Node conditions are [A, B, C] |  |
+		   |                                                 | |-------------------------------|  |
+		   | ------------------------------------------\     |                                    |
+		   |-| Updates internal node conditions to [A] |     |                                    |
+		   | |-----------------------------------------|     |                                    |
+		   |                                                 |                                    |
+		   | Patch delete: B, upsert A                       |                                    |
+		   |------------------------------------------------>|                                    |
+		   |                                                 |                                    |
+	*/
+	// In order to calculate that last patch to delete B, and upsert C, we need to know that C was added by
+	// "someone else". So, we keep track of our last applied value, and our current value. We then generate
+	// our patch based on the diff of these and *not* server side state.
+	// This may be null. It should really only be used for diffing conditions.
+	latestNodeAppliedtoAPIServer *corev1.Node
+	// This must not be null. Generally this should be used throughout the controller.
+	latestNodeReceivedFromProvider *corev1.Node
 
 	leases v1beta1.LeaseInterface
 	nodes  v1.NodeInterface
@@ -200,7 +237,7 @@ func (n *NodeController) Run(ctx context.Context) error {
 	}
 
 	n.lease = newLease(n.lease)
-	setLeaseAttrs(n.lease, n.n, n.pingInterval*5)
+	setLeaseAttrs(n.lease, n.latestNodeReceivedFromProvider, n.pingInterval*5)
 
 	l, err := ensureLease(ctx, n.leases, n.lease)
 	if err != nil {
@@ -222,11 +259,11 @@ func (n *NodeController) ensureNode(ctx context.Context) error {
 		return err
 	}
 
-	node, err := n.nodes.Create(n.n)
+	node, err := n.nodes.Create(n.latestNodeReceivedFromProvider)
 	if err != nil {
 		return pkgerrors.Wrap(err, "error registering node with kubernetes")
 	}
-	n.n = node
+	n.latestNodeAppliedtoAPIServer = node
 
 	return nil
 }
@@ -277,7 +314,7 @@ func (n *NodeController) controlLoop(ctx context.Context) error {
 				<-t.C
 			}
 
-			n.n.Status = updated.Status
+			n.latestNodeReceivedFromProvider.Status = updated.Status
 			if err := n.updateStatus(ctx, false); err != nil {
 				log.G(ctx).WithError(err).Error("Error handling node status update")
 			}
@@ -327,9 +364,9 @@ func (n *NodeController) updateLease(ctx context.Context) error {
 }
 
 func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) error {
-	updateNodeStatusHeartbeat(n.n)
+	updateNodeStatusHeartbeat(n.latestNodeReceivedFromProvider)
 
-	node, err := updateNodeStatus(ctx, n.nodes, n.n)
+	_, err := updateNodeStatus(ctx, n.nodes, n.latestNodeAppliedtoAPIServer, n.latestNodeReceivedFromProvider)
 	if err != nil {
 		if skipErrorCb || n.nodeStatusUpdateErrorHandler == nil {
 			return err
@@ -338,13 +375,13 @@ func (n *NodeController) updateStatus(ctx context.Context, skipErrorCb bool) err
 			return err
 		}
 
-		node, err = updateNodeStatus(ctx, n.nodes, n.n)
+		_, err = updateNodeStatus(ctx, n.nodes, n.latestNodeAppliedtoAPIServer, n.latestNodeReceivedFromProvider)
 		if err != nil {
 			return err
 		}
 	}
 
-	n.n = node
+	n.latestNodeAppliedtoAPIServer = n.latestNodeReceivedFromProvider
 	return nil
 }
 
@@ -406,41 +443,39 @@ func updateNodeLease(ctx context.Context, leases v1beta1.LeaseInterface, lease *
 // just so we don't have to allocate this on every get request
 var emptyGetOptions = metav1.GetOptions{}
 
-// patchNodeStatus patches node status.
-// Copied from github.com/kubernetes/kubernetes/pkg/util/node
-func patchNodeStatus(nodes v1.NodeInterface, nodeName types.NodeName, oldNode *corev1.Node, newNode *corev1.Node) (*corev1.Node, []byte, error) {
-	patchBytes, err := preparePatchBytesforNodeStatus(nodeName, oldNode, newNode)
+func preparePatchBytesforNodeStatus(nodeName types.NodeName, oldNodeFromProvider, newNodeFromProvider, apiServerNode *corev1.Node) ([]byte, error) {
+
+	newNodeFromProviderData, err := json.Marshal(newNodeFromProvider)
 	if err != nil {
-		return nil, nil, err
+		return nil, pkgerrors.Wrapf(err, "failed to Marshal newNodeFromProviderData for node %q", nodeName)
 	}
 
-	updatedNode, err := nodes.Patch(string(nodeName), types.StrategicMergePatchType, patchBytes, "status")
+	apiServerNodeData, err := json.Marshal(apiServerNode)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to patch status %q for node %q: %v", patchBytes, nodeName, err)
-	}
-	return updatedNode, patchBytes, nil
-}
-
-func preparePatchBytesforNodeStatus(nodeName types.NodeName, oldNode *corev1.Node, newNode *corev1.Node) ([]byte, error) {
-	oldData, err := json.Marshal(oldNode)
-	if err != nil {
-		return nil, fmt.Errorf("failed to Marshal oldData for node %q: %v", nodeName, err)
+		return nil, pkgerrors.Wrapf(err, "Failed to marshal apiServerNodeData for node %q", nodeName)
 	}
 
-	// Reset spec to make sure only patch for Status or ObjectMeta is generated.
-	// Note that we don't reset ObjectMeta here, because:
-	// 1. This aligns with Nodes().UpdateStatus().
-	// 2. Some component does use this to update node annotations.
-	newNode.Spec = oldNode.Spec
-	newData, err := json.Marshal(newNode)
-	if err != nil {
-		return nil, fmt.Errorf("failed to Marshal newData for node %q: %v", nodeName, err)
+	// We may never have patched the server before. In this case, generate a simple two way merge. This is imperfect if
+	// the kubelet crashed. But, this is a good babystep to storing the VK-owned annotations in the server, or some such.
+	if oldNodeFromProvider == nil {
+		patchBytes, err := strategicpatch.CreateTwoWayMergePatch(apiServerNodeData, newNodeFromProviderData, &corev1.Node{})
+		return patchBytes, err
 	}
 
-	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, corev1.Node{})
+	schema, err := strategicpatch.NewPatchMetaFromStruct(&corev1.Node{})
 	if err != nil {
-		return nil, fmt.Errorf("failed to CreateTwoWayMergePatch for node %q: %v", nodeName, err)
+		return nil, err
 	}
+
+	oldNodeFromProviderData, err := json.Marshal(oldNodeFromProvider)
+	if err != nil {
+		return nil, pkgerrors.Wrapf(err, "failed to Marshal oldNodeFromProviderData for node %q", nodeName)
+	}
+	patchBytes, err := strategicpatch.CreateThreeWayMergePatch(oldNodeFromProviderData, newNodeFromProviderData, apiServerNodeData, schema, true)
+	if err != nil {
+		return nil, pkgerrors.Wrapf(err, "failed to CreateThreeWayMergePatch for node %q", nodeName)
+	}
+
 	return patchBytes, nil
 }
 
@@ -450,29 +485,37 @@ func preparePatchBytesforNodeStatus(nodeName types.NodeName, oldNode *corev1.Nod
 //
 // If you use this function, it is up to you to synchronize this with other operations.
 // This reduces the time to second-level precision.
-func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, n *corev1.Node) (_ *corev1.Node, retErr error) {
+func updateNodeStatus(ctx context.Context, nodes v1.NodeInterface, oldNode, newNode *corev1.Node) (_ *corev1.Node, retErr error) {
 	ctx, span := trace.StartSpan(ctx, "UpdateNodeStatus")
 	defer func() {
 		span.End()
 		span.SetStatus(retErr)
 	}()
 
-	var node *corev1.Node
-
-	oldNode, err := nodes.Get(n.Name, emptyGetOptions)
-	if err != nil {
-		return nil, err
-	}
-
-	log.G(ctx).Debug("got node from api server")
-	node = oldNode.DeepCopy()
-	node.ResourceVersion = ""
-	node.Status = n.Status
-
-	ctx = addNodeAttributes(ctx, span, node)
+	ctx = addNodeAttributes(ctx, span, newNode)
 
 	// Patch the node status to merge other changes on the node.
-	updated, _, err := patchNodeStatus(nodes, types.NodeName(n.Name), oldNode, node)
+	var updated *corev1.Node
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		var err error
+		apiserverNode, err := nodes.Get(newNode.Name, emptyGetOptions)
+		if err != nil {
+			return err
+		}
+		log.G(ctx).Debug("got node from api server")
+
+		patchBytes, err := preparePatchBytesforNodeStatus(types.NodeName(newNode.Name), oldNode, newNode, apiserverNode)
+		if err != nil {
+			return err
+		}
+
+		updated, err = nodes.Patch(newNode.Name, types.StrategicMergePatchType, patchBytes, "status")
+		if err != nil {
+			return pkgerrors.Wrapf(err, "failed to patch status %q for node %q", patchBytes, newNode.Name)
+		}
+
+		return err
+	})
 	if err != nil {
 		return nil, err
 	}
