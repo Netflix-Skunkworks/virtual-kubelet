@@ -291,6 +291,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) (retErr er
 			if key, err := cache.MetaNamespaceKeyFunc(pod); err != nil {
 				log.G(ctx).Error(err)
 			} else {
+				log.G(ctx).Infof("AddFunc key %s to workqueue", key)
 				pc.knownPods.Store(key, &knownPod{})
 				pc.k8sQ.AddRateLimited(key)
 			}
@@ -304,6 +305,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) (retErr er
 			if key, err := cache.MetaNamespaceKeyFunc(newPod); err != nil {
 				log.G(ctx).Error(err)
 			} else {
+				log.G(ctx).Infof("UpdateFunc key %s to workqueue", key)
 				if podShouldEnqueue(oldPod, newPod) {
 					pc.k8sQ.AddRateLimited(key)
 				}
@@ -313,6 +315,7 @@ func (pc *PodController) Run(ctx context.Context, podSyncWorkers int) (retErr er
 			if key, err := cache.DeletionHandlingMetaNamespaceKeyFunc(pod); err != nil {
 				log.G(ctx).Error(err)
 			} else {
+				log.G(ctx).Infof("DeleteFunc key %s to workqueue", key)
 				pc.knownPods.Delete(key)
 				pc.k8sQ.AddRateLimited(key)
 				// If this pod was in the deletion queue, forget about it
