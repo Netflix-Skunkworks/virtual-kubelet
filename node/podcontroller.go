@@ -175,6 +175,9 @@ type PodControllerConfig struct {
 	// RateLimiter defines the rate limit of work queue
 	RateLimiter workqueue.RateLimiter
 
+	// Allows pluggable metrics providers to get metrics out of the workqueues
+	MetricsProvider workqueue.MetricsProvider
+
 	// Add custom filtering for pod informer event handlers
 	// Use this for cases where the pod informer handles more than pods assigned to this node
 	//
@@ -208,6 +211,9 @@ func NewPodController(cfg PodControllerConfig) (*PodController, error) {
 	}
 	if cfg.RateLimiter == nil {
 		cfg.RateLimiter = workqueue.DefaultControllerRateLimiter()
+	}
+	if cfg.MetricsProvider != nil {
+		workqueue.SetProvider(cfg.MetricsProvider)
 	}
 	rm, err := manager.NewResourceManager(cfg.PodInformer.Lister(), cfg.SecretInformer.Lister(), cfg.ConfigMapInformer.Lister(), cfg.ServiceInformer.Lister())
 	if err != nil {
