@@ -216,7 +216,10 @@ func (pc *PodController) updatePodStatus(ctx context.Context, podFromKubernetes 
 	kPod.Lock()
 
 	podFromProvider := kPod.lastPodStatusReceivedFromProvider.DeepCopy()
-	if cmp.Equal(podFromKubernetes.Status, podFromProvider.Status) && podFromProvider.DeletionTimestamp == nil {
+	if cmp.Equal(podFromKubernetes.Status, podFromProvider.Status) &&
+		podFromProvider.DeletionTimestamp == nil &&
+		cmp.Equal(podFromKubernetes.ObjectMeta.Annotations, podFromProvider.ObjectMeta.Annotations) &&
+		cmp.Equal(podFromKubernetes.ObjectMeta.Labels, podFromProvider.ObjectMeta.Labels) {
 		kPod.lastPodStatusUpdateSkipped = true
 		kPod.Unlock()
 		return nil
